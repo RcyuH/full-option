@@ -43,36 +43,41 @@ def export_report(root: Path) -> None:
     if not path.exists():
         return
     scores = json.loads(path.read_text())
-    landscape = np.full((depth, depth), np.nan)
+    landscapes = {}
     for name, value in scores.items():
         route = Route.parse(name)
         if route.start is not None:
+            landscape = landscapes.setdefault(
+                route.repeat_count, np.full((depth, depth), np.nan)
+            )
             landscape[route.start - 1, route.end - 1] = 100 * (
                 value["accuracy"] - scores["standard"]["accuracy"]
             )
-    if not np.isfinite(landscape).any():
-        return
-    bound = max(1.0, float(np.nanmax(np.abs(landscape))))
-    fig, ax = plt.subplots(figsize=(8, 6))
-    cmap = plt.get_cmap("RdBu").copy()
-    cmap.set_bad("#e5e7eb")
-    im = ax.imshow(
-        landscape,
-        cmap=cmap,
-        vmin=-bound,
-        vmax=bound,
-        origin="upper",
-        extent=(0.5, depth + 0.5, depth + 0.5, 0.5),
-    )
-    ax.set(
-        xlabel="Last repeated layer j (inclusive)",
-        ylabel="First repeated layer i (inclusive)",
-        title=(
-            f"Search stage 1, n={scores['standard']['n']}\n"
-            "Accuracy change vs standard; not test performance"
-        ),
-    )
-    fig.colorbar(im, ax=ax, label="Accuracy difference (percentage points)")
-    fig.tight_layout()
-    fig.savefig(root / "route_landscape.png", dpi=180)
-    plt.close(fig)
+    for factor, landscape in landscapes.items():
+        if not np.isfinite(landscape).any():
+            continue
+        bound = max(1.0, float(np.nanmax(np.abs(landscape))))
+        fig, ax = plt.subplots(figsize=(8, 6))
+        cmap = plt.get_cmap("RdBu").copy()
+        cmap.set_bad("#e5e7eb")
+        im = ax.imshow(
+            landscape,
+            cmap=cmap,
+            vmin=-bound,
+            vmax=bound,
+            origin="upper",
+            extent=(0.5, depth + 0.5, depth + 0.5, 0.5),
+        )
+        ax.set(
+            xlabel="Last repeated layer j (inclusive)",
+            ylabel="First repeated layer i (inclusive)",
+            title=(
+                f"Search stage 1, loop factor {factor}, n={scores['standard']['n']}\n"
+                "Accuracy change vs standard; not test performance"
+            ),
+        )
+        fig.colorbar(im, ax=ax, label="Accuracy difference (percentage points)")
+        fig.tight_layout()
+        filename = "route_landscape.png" if factor == 2 else f"route_landscape_x{factor}.png"
+        fig.savefig(root / filename, dpi=180)
+        plt.close(fig)

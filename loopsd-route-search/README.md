@@ -1,6 +1,6 @@
 # LoOPSD route search on Qwen3
 
-Tìm đoạn lớp chạy hai lần, giữ nguyên trọng số, rồi so sánh route được chọn với
+Tìm đoạn lớp chạy lặp lại, giữ nguyên trọng số, rồi so sánh route được chọn với
 đường chạy chuẩn trên GSM8K test. Đây là phần **teacher construction** của
 [LoOPSD v1](https://arxiv.org/pdf/2610.18162v1#page=13); chưa có distillation/training.
 
@@ -37,6 +37,27 @@ attention bị từ chối rõ ràng. `device: auto` ưu tiên CUDA, rồi MPS, 
 Mac 16 GB dùng được để kiểm tra nhỏ; full search gồm hơn 74 nghìn lượt sinh khi
 không có thêm route đồng hạng, nên nên chạy trên GPU CUDA. Tăng batch size theo
 bộ nhớ GPU, nhưng dùng thư mục output mới khi đổi cấu hình.
+
+### Chọn số lần chạy của đoạn lặp
+
+`search.loop_factors` là tổng số lần các layer trong đoạn được thực thi, tính cả
+lần xuất hiện ban đầu. `[2]` tái lập route search hiện tại; `[3]` chạy đoạn đó
+ba lần tổng cộng; `[4]` chạy bốn lần tổng cộng. Mỗi hệ số sẽ xét tất cả các đoạn
+liên tiếp. Để so sánh 3 lần và 4 lần, chạy hai cấu hình riêng với
+`loop_factors: [3]` và `loop_factors: [4]`, đồng thời đặt `output_dir` khác nhau.
+Không dùng lại thư mục kết quả của hệ số khác.
+
+Ví dụ trong YAML:
+
+```yaml
+search:
+  loop_factors: [3]
+  candidate_routes: null
+output_dir: ../outputs/qwen3_1p7b_gsm8k_loop3
+```
+
+Đổi thành `[4]` và một `output_dir` mới để chạy hệ số 4. Route tường minh cũng
+có thể viết như `8:12x3`; `8:12` vẫn có nghĩa là đoạn 8–12 chạy hai lần tổng cộng.
 
 ## Quy trình
 

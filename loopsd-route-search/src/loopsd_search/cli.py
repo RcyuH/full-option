@@ -43,7 +43,9 @@ def main() -> None:
     if raw_config["model_type"] != "qwen3" or raw_config["use_sliding_window"]:
         raise ValueError("Only dense full-attention Qwen3 is supported")
     depth = raw_config["num_hidden_layers"]
-    routes = enumerate_routes(depth, cfg.search.candidate_routes)
+    routes = enumerate_routes(
+        depth, cfg.search.candidate_routes, cfg.search.loop_factors
+    )
     splits = search_splits(cfg.data)
     if not (cfg.nemo_rl_path / "nemo_rl/models/generation/interfaces.py").exists():
         raise ValueError("nemo_rl_path does not point to the requested NeMo RL checkout")
@@ -57,6 +59,7 @@ def main() -> None:
                     "device": cfg.model.device,
                     "dtype": cfg.model.dtype,
                     "candidate_loops": len(routes) - 1,
+                    "loop_factors": cfg.search.loop_factors,
                     "stage1_generations": len(routes) * len(splits["stage1"]),
                     "stage2_generations_without_cutoff_ties": (
                         1 + min(len(routes) - 1, cfg.search.top_k_stage1)

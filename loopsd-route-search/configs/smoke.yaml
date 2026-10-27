@@ -17,6 +17,7 @@ decode:
 search:
   top_k_stage1: 1
   top_k_stage2: 1
+  loop_factors: [2]
   candidate_routes: ['8:12']
 evaluation:
   test_limit: 2

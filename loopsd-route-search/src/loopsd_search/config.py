@@ -61,8 +61,21 @@ class SearchConfig(StrictConfig):
     top_k_stage1: int = Field(default=24, ge=1)
     top_k_stage2: int = Field(default=5, ge=1)
     tie_seed: int = 42
+    # Total number of executions of each candidate interval, including its
+    # original pass. The paper setup is a two-pass loop.
+    loop_factors: list[int] = Field(default_factory=lambda: [2])
     # null means all L(L+1)/2 intervals. IDs use 1-based inclusive paper indices.
     candidate_routes: list[str] | None = None
+
+    @model_validator(mode="after")
+    def validate_loop_factors(self) -> "SearchConfig":
+        if not self.loop_factors:
+            raise ValueError("loop_factors must contain at least one value")
+        if any(factor < 2 for factor in self.loop_factors):
+            raise ValueError("loop_factors must contain integers >= 2")
+        if len(set(self.loop_factors)) != len(self.loop_factors):
+            raise ValueError("loop_factors must not contain duplicates")
+        return self
 
 
 class EvalConfig(StrictConfig):

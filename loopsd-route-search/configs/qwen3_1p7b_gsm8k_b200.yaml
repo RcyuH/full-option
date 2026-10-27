@@ -27,6 +27,7 @@ search:
   top_k_stage1: 24
   top_k_stage2: 5
   tie_seed: 42
+  loop_factors: [2]  # total executions of the selected layer interval
   candidate_routes: null
 evaluation:
   test_limit: null
