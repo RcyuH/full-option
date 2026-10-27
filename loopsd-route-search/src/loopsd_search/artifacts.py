@@ -5,7 +5,6 @@ import importlib.metadata
 import json
 import os
 import platform
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -43,23 +42,27 @@ def model_fingerprint(path: Path) -> dict[str, str]:
     return {item.name: digest_file(item) for item in files}
 
 
+def directory_fingerprint(path: Path) -> str:
+    """Hash source files by relative path, without requiring Git metadata."""
+    files = sorted(
+        item
+        for item in path.rglob("*")
+        if item.is_file()
+        and "__pycache__" not in item.parts
+        and item.suffix != ".pyc"
+    )
+    if not files:
+        raise ValueError(f"No source files found under {path}")
+    inventory = {
+        item.relative_to(path).as_posix(): digest_file(item) for item in files
+    }
+    return digest_json(inventory)
+
+
 def make_manifest(cfg: ExperimentConfig, split_ids: dict[str, list[str]]) -> dict:
     root = Path(__file__).resolve().parent
     source = {item.name: digest_file(item) for item in sorted(root.glob("*.py"))}
-    git_root = Path(
-        subprocess.check_output(
-            ["git", "-C", str(cfg.nemo_rl_path), "rev-parse", "--show-toplevel"], text=True
-        ).strip()
-    )
-    nemo_commit = subprocess.check_output(
-        ["git", "-C", str(git_root), "rev-parse", "HEAD"], text=True
-    ).strip()
     nemo_package = (cfg.nemo_rl_path / "nemo_rl").resolve()
-    nemo_package_relative = nemo_package.relative_to(git_root)
-    nemo_diff = subprocess.check_output(
-        ["git", "-C", str(git_root), "diff", "HEAD", "--", str(nemo_package_relative)],
-        text=True,
-    )
     value = {
         "schema_version": 1,
         "config": cfg.model_dump(mode="json"),
@@ -67,8 +70,9 @@ def make_manifest(cfg: ExperimentConfig, split_ids: dict[str, list[str]]) -> dic
         "train_sha256": digest_file(cfg.data.train),
         "test_sha256": digest_file(cfg.data.test),
         "source_sha256": source,
-        "nemo_commit": nemo_commit,
-        "nemo_tracked_diff_sha256": hashlib.sha256(nemo_diff.encode()).hexdigest(),
+        # Hash the actual package files. This works for both Git clones and
+        # source snapshots/archives where nested .git metadata is unavailable.
+        "nemo_source_sha256": directory_fingerprint(nemo_package),
         "split_ids": split_ids,
         "python": platform.python_version(),
         "platform": platform.platform(),
