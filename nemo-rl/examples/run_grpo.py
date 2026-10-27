@@ -1,0 +1,268 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import argparse
+import os
+import pprint
+import time
+
+from omegaconf import OmegaConf
+
+from nemo_rl.algorithms.grpo import (
+    MasterConfig,
+    grpo_train,
+    setup,
+)
+from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.data.utils import setup_response_data
+from nemo_rl.data_plane.factory import (
+    make_policy_factory,
+    maybe_configure_data_plane_env,
+    select_sync_trainer,
+)
+from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.environments.utils import shutdown_environments
+from nemo_rl.models.generation import (
+    configure_generation_config,
+    draft_full_refit_enabled,
+)
+from nemo_rl.models.policy.draft_config import draft_refit_enabled
+from nemo_rl.telemetry.instrumentation import setup_span, startup_span
+from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
+from nemo_rl.utils.config import (
+    load_config,
+    parse_hydra_overrides,
+    register_omegaconf_resolvers,
+)
+from nemo_rl.utils.logger import get_next_experiment_dir, log_container_init_timing
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
+from nemo_rl.utils.timer import Timer
+
+
+def parse_args() -> tuple[argparse.Namespace, list[str]]:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description="Run GRPO training with configuration")
+    parser.add_argument(
+        "--config", type=str, default=None, help="Path to YAML config file"
+    )
+
+    # Parse known args for the script
+    args, overrides = parser.parse_known_args()
+
+    return args, overrides
+
+
+def main() -> None:
+    """Main entry point."""
+    main_start = time.perf_counter()
+    log_container_init_timing()
+
+    rl_init_timer = Timer(context={"worker": "driver"})
+
+    # Parse arguments
+    register_omegaconf_resolvers()
+    args, overrides = parse_args()
+
+    if not args.config:
+        args.config = os.path.join(
+            os.path.dirname(__file__), "configs", "grpo_math_1B.yaml"
+        )
+
+    with rl_init_timer.time("config"):
+        config = load_config(args.config)
+        print(f"Loaded configuration from: {args.config}")
+
+        if overrides:
+            print(f"Overrides: {overrides}")
+            config = parse_hydra_overrides(config, overrides)
+
+        config = OmegaConf.to_container(config, resolve=True)
+        check_outdated_config(config)
+        config = MasterConfig(**config)
+        print("Applied CLI overrides")
+
+    # Print config
+    print("Final config:")
+    pprint.pprint(config)
+
+    # Get the next experiment directory with incremented ID
+    config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
+    print(f"📊 Using log directory: {config.logger.log_dir}")
+    if config.checkpointing["enabled"]:
+        print(
+            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
+        )
+
+    # Initialise telemetry on the driver BEFORE init_ray() so the resolved
+    # NEMO_RL_OTEL_* env is snapshotted into the Ray runtime_env and inherited
+    # by every worker. No-op unless telemetry is on.
+    init_telemetry_driver(config, algorithm="grpo")
+
+    try:
+        # One root span, so init_ray() and setup() phases land in the same
+        # trace. Timer labels match the span names so the printed breakdown
+        # and the waterfall name a phase the same way.
+        with startup_span():
+            with rl_init_timer.time("ray_init"):
+                # Must precede init_ray() — see maybe_configure_data_plane_env's docstring.
+                maybe_configure_data_plane_env(config.data_plane)
+                # Opens rl.setup.ray_init itself, so no span here.
+                init_ray()
+
+            # setup tokenizer
+            with rl_init_timer.time("tokenizer"), setup_span("tokenizer"):
+                tokenizer = get_tokenizer(config.policy["tokenizer"])
+                assert config.policy["generation"] is not None, (
+                    "A generation config is required for GRPO"
+                )
+                has_refit_draft_weights = draft_refit_enabled(
+                    config.policy.get("draft")
+                )
+                megatron_cfg = config.policy.get("megatron_cfg") or {}
+                trains_mtp = bool(megatron_cfg.get("mtp_num_layers"))
+                config.policy["generation"] = configure_generation_config(
+                    config.policy["generation"],
+                    tokenizer,
+                    has_refit_draft_weights=has_refit_draft_weights,
+                    trains_mtp=trains_mtp,
+                    draft_full_refit=draft_full_refit_enabled(config.policy),
+                )
+
+            # setup data
+            with rl_init_timer.time("data"), setup_span("data"):
+                dataset, val_dataset, task_to_env, val_task_to_env = (
+                    setup_response_data(tokenizer, config.data, config.env)
+                )
+
+            # No child spans here: parallel init runs in threads, which do not
+            # carry the OTel context. The breakdown comes from the
+            # rl.setup.duration metric instead.
+            with rl_init_timer.time("workers"), setup_span("workers"):
+                (
+                    policy,
+                    policy_generation,
+                    _nemo_gym,
+                    cluster,
+                    dataloader,
+                    val_dataloader,
+                    loss_fn,
+                    logger,
+                    checkpointer,
+                    grpo_state,
+                    master_config,
+                    teacher_worker_groups,
+                    alias_to_group_alias,
+                ) = setup(
+                    config,
+                    tokenizer,
+                    dataset,
+                    val_dataset,
+                    policy_factory=make_policy_factory(config.data_plane),
+                )
+
+            rl_init_timer.record("total", time.perf_counter() - main_start)
+
+        rl_init_metrics = rl_init_timer.get_timing_metrics(reduction_op="sum")
+        print("\n" + "=" * 60)
+        print(" " * 14 + "RL INIT TIMING BREAKDOWN")
+        for label, value in sorted(rl_init_metrics.items()):
+            if isinstance(value, (int, float)):
+                print(f"  {label}: {value:.1f}s")
+        print("=" * 60 + "\n", flush=True)
+
+        trainer_owns_environment_shutdown = False
+        try:
+            # Check if async mode is enabled
+            if config.grpo.async_grpo.enabled:
+                # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
+                if config.grpo.use_dynamic_sampling:
+                    raise NotImplementedError(
+                        "use_dynamic_sampling is not supported with async GRPO"
+                    )
+                if config.grpo.reward_scaling.enabled:
+                    raise NotImplementedError(
+                        "reward_scaling is not supported with async GRPO"
+                    )
+                if config.grpo.reward_shaping.enabled:
+                    raise NotImplementedError(
+                        "reward_shaping is not supported with async GRPO"
+                    )
+
+                # Async GRPO does not support multiple dataloaders
+                if config.data["use_multiple_dataloader"]:
+                    raise NotImplementedError(
+                        "use_multiple_dataloader is not supported with async GRPO"
+                    )
+
+                from nemo_rl.algorithms.grpo import async_grpo_train
+
+                print("🚀 Running async GRPO training")
+
+                # Run async GRPO training
+                async_grpo_train(
+                    policy=policy,
+                    policy_generation=policy_generation,
+                    dataloader=dataloader,
+                    val_dataloader=val_dataloader,
+                    tokenizer=tokenizer,
+                    loss_fn=loss_fn,
+                    task_to_env=task_to_env,
+                    val_task_to_env=val_task_to_env,
+                    logger=logger,
+                    checkpointer=checkpointer,
+                    grpo_save_state=grpo_state,
+                    master_config=master_config,
+                    max_trajectory_age_steps=config.grpo.async_grpo.max_trajectory_age_steps,
+                    teacher_worker_groups=teacher_worker_groups,
+                    alias_to_group_alias=alias_to_group_alias,
+                )
+            else:
+                # Two parallel synchronous trainers (verl-style — main_ppo.py vs
+                # main_ppo_sync.py). data_plane.enabled selects which one runs.
+                trainer = select_sync_trainer(master_config)
+                trainer_owns_environment_shutdown = trainer is grpo_train
+                # grpo_train_sync defers checkpoint finalization to the checkpointer's
+                # background threads; the context manager guarantees they are flushed on
+                # exit. (grpo_train also flushes internally; shutdown() is idempotent.)
+                with checkpointer:
+                    trainer(
+                        policy,
+                        policy_generation,
+                        dataloader,
+                        val_dataloader,
+                        tokenizer,
+                        loss_fn,
+                        task_to_env,
+                        val_task_to_env,
+                        logger,
+                        checkpointer,
+                        grpo_state,
+                        master_config,
+                    )
+        finally:
+            if not trainer_owns_environment_shutdown:
+                shutdown_environments(task_to_env, val_task_to_env)
+            try:
+                policy_generation.shutdown()
+            except Exception as error:
+                print(f"Error shutting down generation: {error}", flush=True)
+    finally:
+        # Flush on the failure paths too, and before cluster teardown: the OTel
+        # SDK's own atexit hook is registered ahead of Ray's and so runs after
+        # it. No-op when telemetry is inactive.
+        shutdown_telemetry()
+
+
+if __name__ == "__main__":
+    main()

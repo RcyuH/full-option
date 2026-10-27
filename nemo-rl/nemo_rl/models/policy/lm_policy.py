@@ -1,0 +1,1620 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import os
+import warnings
+from collections import defaultdict
+from contextlib import nullcontext
+from typing import Any, Iterable, Optional, Union
+
+import numpy as np
+import ray
+import torch
+from ray.util.queue import Queue as RayQueue
+from transformers import AutoProcessor, PreTrainedTokenizerBase
+
+from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data.megatron_sft_packed import (
+    MEGATRON_SFT_PACKED_BATCH_FIELDS,
+    is_direct_packed_row,
+)
+from nemo_rl.distributed.batched_data_dict import (
+    BatchedDataDict,
+    DynamicBatchingArgs,
+    SequencePackingArgs,
+    SlicedDataDict,
+)
+from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.models.generation.interfaces import (
+    GenerationDatumSpec,
+    GenerationInterface,
+    GenerationOutputSpec,
+)
+from nemo_rl.models.policy import (
+    BLOCK_DRAFT_ALGOS,
+    PolicyConfig,
+)
+from nemo_rl.models.policy.draft_config import coerce_draft_config
+from nemo_rl.models.policy.interfaces import (
+    ColocatablePolicyInterface,
+    LogprobOutputSpec,
+    ReferenceLogprobOutputSpec,
+    ScoreOutputSpec,
+    TopkLogitsOutputSpec,
+)
+from nemo_rl.models.policy.utils import (
+    DETERMINISTIC_ENV_VARS,
+    aggregate_per_sample_handles,
+    resolve_policy_worker_cls,
+    validate_fp32_lm_head_config,
+    validate_lora_refit_policy_config,
+)
+from nemo_rl.utils.flops_tracker import (
+    FLOPTracker,
+    get_hf_config,
+    get_theoretical_tflops,
+)
+from nemo_rl.utils.multimodal_payload_metrics import (
+    collect_sharded_multimodal_payload_metrics,
+    print_multimodal_payload_metrics,
+)
+from nemo_rl.utils.path_utils import checkpoint_abspath
+from nemo_rl.utils.timer import Timer
+
+PathLike = Union[str, "os.PathLike[Any]"]
+
+_DIRECT_PACKED_SFT_REQUIRED_KEYS = MEGATRON_SFT_PACKED_BATCH_FIELDS
+
+
+def _aggregate_megatron_flops_metrics(
+    results: list[dict],
+    world_size: int,
+) -> dict:
+    """Aggregate FLOPS metrics from Megatron worker results.
+
+    Called when the Megatron worker returns total_flops directly (no FLOPTracker).
+    """
+    aggregated: dict = {}
+    aggregated["total_flops"] = results[0]["total_flops"]
+    aggregated["num_ranks"] = results[0].get("num_ranks", world_size)
+    if "train_elapsed_seconds" in results[0]:
+        aggregated["train_elapsed_seconds"] = results[0]["train_elapsed_seconds"]
+    try:
+        aggregated["theoretical_tflops"] = aggregated[
+            "num_ranks"
+        ] * get_theoretical_tflops(results[0]["gpu_name"], results[0]["model_dtype"])
+    except Exception as e:
+        warnings.warn(f"Error getting theoretical flops: {e}")
+    return aggregated
+
+
+class Policy(ColocatablePolicyInterface, GenerationInterface):
+    def __init__(
+        self,
+        cluster: RayVirtualCluster,
+        config: PolicyConfig,
+        tokenizer: PreTrainedTokenizerBase,
+        name_prefix: str = "lm_policy",
+        workers_per_node: Optional[Union[int, list[int]]] = None,
+        init_optimizer: bool = True,
+        weights_path: Optional[PathLike] = None,
+        optimizer_path: Optional[PathLike] = None,
+        init_reference_model: bool = True,
+        processor: Optional[AutoProcessor] = None,
+        worker_extension_cls_fqn: Optional[str] = None,
+        skip_weight_load: bool = False,
+        is_refit_destination: bool = False,
+        reserved_http_server_ports: Optional[dict[int, int]] = None,
+    ):
+        self.debug_payload_metrics = False
+        configured_extension_fqn = config.get("worker_extension_cls_fqn")
+        if (
+            configured_extension_fqn is not None
+            and worker_extension_cls_fqn is not None
+            and configured_extension_fqn != worker_extension_cls_fqn
+        ):
+            raise ValueError(
+                "worker_extension_cls_fqn was set to different values in the "
+                "policy config and Policy constructor"
+            )
+        extension_fqn = (
+            configured_extension_fqn
+            if configured_extension_fqn is not None
+            else worker_extension_cls_fqn
+        )
+        # Only the config-supplied FQN is mutually exclusive with quant_cfg: a config
+        # author cannot know which worker quant_cfg resolves to, so silently replacing
+        # it would be a footgun. The constructor argument is exempt because callers
+        # passing it already see the resolved class name and are expected to subclass
+        # it, which has always been supported alongside quantization.
+        if configured_extension_fqn is not None and config.get("quant_cfg") is not None:
+            raise ValueError(
+                "worker_extension_cls_fqn and quant_cfg are mutually exclusive: "
+                "a custom policy worker cannot be combined with ModelOpt quantization"
+            )
+        if extension_fqn is not None:
+            # Validate registration before allocating workers or placement groups.
+            get_actor_python_env(extension_fqn)
+
+        if weights_path:
+            weights_path = checkpoint_abspath(weights_path)
+        if optimizer_path:
+            optimizer_path = checkpoint_abspath(optimizer_path)
+
+        worker_builder_cls_fqn: str
+        tp_size = 1
+        pp_size = 1
+        cp_size = 1
+
+        megatron_enabled = bool(config.get("megatron_cfg", {}).get("enabled", False))
+        automodel_enabled = bool(config.get("automodel_cfg", {}).get("enabled", False))
+        validate_lora_refit_policy_config(config)
+        # Normalize in place: every downstream reader (workers, setup, train)
+        # accesses draft config by attribute, so a hand-built PolicyConfig has
+        # to be validated here rather than only inside MasterConfig.
+        draft_config = coerce_draft_config(config.get("draft"))
+        if draft_config is not None:
+            config["draft"] = draft_config
+        draft_enabled = bool(draft_config is not None and draft_config.enabled)
+        generation_config = config.get("generation") or {}
+        nvfp4_pertoken_rollout = generation_config.get("nvfp4_pertoken_rollout") or {}
+        if megatron_enabled and automodel_enabled:
+            raise ValueError(
+                "Configure either Megatron (policy.megatron_cfg.enabled=true) or "
+                "Automodel (policy.automodel_cfg.enabled=true), not both. A config "
+                "that used to set policy.dtensor_cfg.enabled=false must now set "
+                "policy.automodel_cfg.enabled=false: dtensor_cfg has been renamed "
+                "and no longer disables anything."
+            )
+        if not megatron_enabled and not automodel_enabled:
+            raise ValueError(
+                "Please either set policy.megatron_cfg.enabled=true to use Megatron training backend "
+                "or set policy.automodel_cfg.enabled=true to use the Automodel training backend."
+            )
+        if nvfp4_pertoken_rollout.get("enabled", False) and not megatron_enabled:
+            raise ValueError(
+                "generation.nvfp4_pertoken_rollout requires the Megatron "
+                "training backend (policy.megatron_cfg.enabled=true); Automodel "
+                "does not implement TE NVFP4 training."
+            )
+        validate_fp32_lm_head_config(
+            config,
+            megatron_enabled=megatron_enabled,
+            automodel_enabled=automodel_enabled,
+        )
+        hf_config = None
+        hf_config_overrides = config.get("hf_config_overrides") or {}
+        generation_config = config.get("generation")
+        if generation_config is not None and generation_config["backend"] == "vllm":
+            vllm_cfg = generation_config.get("vllm_cfg")
+            if vllm_cfg is not None and vllm_cfg.get("fp32_lm_head"):
+                hf_config = get_hf_config(
+                    config["model_name"],
+                    **hf_config_overrides,
+                )
+                validate_fp32_lm_head_config(
+                    config,
+                    megatron_enabled=megatron_enabled,
+                    automodel_enabled=automodel_enabled,
+                    model_config=hf_config,
+                )
+        if reserved_http_server_ports is not None and not megatron_enabled:
+            raise ValueError(
+                "reserved_http_server_ports is only supported by the Megatron "
+                "worker (policy.megatron_cfg.enabled=true)."
+            )
+        if draft_enabled:
+            # Both-enabled and neither-enabled are already rejected above, so
+            # exactly one of megatron_enabled/automodel_enabled is true below.
+            draft_algo = draft_config.speculator_type
+            if draft_algo in BLOCK_DRAFT_ALGOS and not automodel_enabled:
+                raise ValueError(
+                    f"policy.draft.speculator_type={draft_algo} requires the "
+                    "Automodel backend (policy.automodel_cfg.enabled=true)."
+                )
+            if megatron_enabled:
+                # Megatron-specific guards (main #3463).
+                if config["megatron_cfg"]["context_parallel_size"] > 1:
+                    # Sequence packing itself is supported with the draft; CP
+                    # is not: the hidden-state capture and the per-segment
+                    # shifts assume each packed sequence lives whole on one
+                    # rank.
+                    raise ValueError(
+                        "policy.draft.enabled=true does not support context "
+                        "parallelism yet. Set "
+                        "policy.megatron_cfg.context_parallel_size=1 or disable "
+                        "policy.draft."
+                    )
+                if (
+                    # sequence_packing is NotRequired in PolicyConfig, so
+                    # tolerate its absence.
+                    bool(config.get("sequence_packing", {}).get("enabled", False))
+                    and config["megatron_cfg"]["pipeline_model_parallel_size"] > 1
+                ):
+                    # The packed draft path re-embeds the per-segment-shifted
+                    # token ids via the model's embedding, which MCore
+                    # constructs only on the first pipeline stage while the
+                    # draft runs on the last.
+                    raise ValueError(
+                        "policy.draft.enabled=true with sequence packing does "
+                        "not support pipeline parallelism yet. Set "
+                        "policy.megatron_cfg.pipeline_model_parallel_size=1, or "
+                        "disable policy.sequence_packing or policy.draft."
+                    )
+                if bool(
+                    # use_fused_linear_logprobs is NotRequired in MegatronConfig.
+                    config["megatron_cfg"].get("use_fused_linear_logprobs", False)
+                ):
+                    # The fused path returns per-token logprobs and never
+                    # materializes the full next-token logits the draft's
+                    # teacher distribution needs, in either the packed or the
+                    # unpacked layout.
+                    raise ValueError(
+                        "policy.draft.enabled=true is not supported with "
+                        "policy.megatron_cfg.use_fused_linear_logprobs=true: "
+                        "draft training needs the full next-token logits for "
+                        "the teacher, which the fused path never materializes. "
+                        "Disable one of the two."
+                    )
+            else:
+                # Automodel draft (eagle3 TTT, dspark, dflash).
+                automodel_cfg = config["automodel_cfg"]
+                if draft_config.model_name is None:
+                    raise ValueError(
+                        f"policy.draft.speculator_type={draft_algo} requires a "
+                        "pretrained draft checkpoint; set policy.draft.model_name "
+                        "(from-scratch draft init is not supported)."
+                    )
+                unsupported = {
+                    # Under sequence parallelism the layer outputs seen by the
+                    # hidden-capture hooks are bare sequence-sharded local tensors
+                    # (no DTensor wrapper), which cannot be detected or gathered.
+                    "sequence_parallel": bool(
+                        automodel_cfg.get("sequence_parallel", False)
+                    ),
+                    "lora_cfg.enabled": bool(
+                        automodel_cfg.get("lora_cfg", {}).get("enabled", False)
+                    ),
+                    "sequence_packing.enabled": bool(
+                        config.get("sequence_packing", {}).get("enabled", False)
+                    ),
+                    # The draft shares the policy's optimizer, but
+                    # prepare_for_training skips the CUDA restore of optimizer
+                    # state under cpu_offload (correct for the policy's
+                    # CPUOffloadPolicy, not for the draft, whose fully_shard
+                    # params/grads stay on CUDA) -- the draft's Adam state is
+                    # left on CPU after offload_before_refit, causing a device
+                    # mismatch in optimizer.step() on the next training step.
+                    "cpu_offload": bool(automodel_cfg.get("cpu_offload", False)),
+                }
+                enabled_unsupported = [name for name, on in unsupported.items() if on]
+                if enabled_unsupported:
+                    raise ValueError(
+                        f"policy.draft.speculator_type={draft_algo} does not "
+                        f"support: {', '.join(enabled_unsupported)}. Disable "
+                        "these options to co-train a draft."
+                    )
+
+            # Draft co-training streams draft.* keys only through the full-param
+            # refit paths (colocated CUDA-IPC, collective broadcast, and
+            # checkpoint-engine). The sparse transports bypass the extension's
+            # draft split entirely and nccl_reshard's suffix-based bulk routing
+            # would misdirect draft FFN keys, leaving the serving drafter
+            # silently stale — reject those combinations up front.
+            from nemo_rl.models.generation.vllm.config import (
+                VLLM_SPARSE_REFIT_TRANSPORTS,
+            )
+
+            refit_transport = (config.get("generation") or {}).get("refit_transport")
+            if refit_transport == "nccl_reshard" or (
+                refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS
+            ):
+                raise ValueError(
+                    "policy.draft.enabled=true does not support "
+                    f"policy.generation.refit_transport={refit_transport!r}: draft "
+                    "weights are streamed only via the full-parameter refit paths. "
+                    "Use refit_transport=null (collective/CUDA-IPC) or a "
+                    "checkpoint-engine transport ('nixl' / 'module:ClassName')."
+                )
+        if megatron_enabled:
+            worker_builder_cls_fqn = resolve_policy_worker_cls(
+                "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",
+                config,
+            )
+            tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
+            pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
+            cp_size = config["megatron_cfg"]["context_parallel_size"]
+
+            env_vars = dict(config["megatron_cfg"].get("env_vars") or {})
+
+            if "TORCH_CUDA_ARCH_LIST" not in os.environ:
+                raise RuntimeError(
+                    "TORCH_CUDA_ARCH_LIST is not set. This is required in Megatron backend. This variable is set in our container, but "
+                    "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
+                )
+
+        else:
+            # automodel_enabled is guaranteed here: both-enabled and
+            # neither-enabled are already rejected above.
+            worker_builder_cls_fqn = resolve_policy_worker_cls(
+                "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker",
+                config,
+            )
+            if "TORCH_CUDA_ARCH_LIST" not in os.environ:
+                warnings.warn(
+                    "TORCH_CUDA_ARCH_LIST is not set. This is needed if using DeepEP in AutomodelPolicyWorker. This variable is set in our container, but "
+                    "if you are running a custom container or baremetal, you may need to set this variable manually. Example: export TORCH_CUDA_ARCH_LIST='9.0 10.0'"
+                )
+
+            tp_size = config["automodel_cfg"]["tensor_parallel_size"]
+            cp_size = config["automodel_cfg"]["context_parallel_size"]
+
+            env_vars = config["automodel_cfg"].get("env_vars", {})
+            if config["automodel_cfg"].get("deterministic"):
+                env_vars = {**(env_vars or {}), **DETERMINISTIC_ENV_VARS}
+
+        # If a worker extension class is provided, use it instead of the default worker builder class
+        if extension_fqn is not None:
+            print(
+                f"Using worker extension class: {extension_fqn}, please make sure it is a subclass of {worker_builder_cls_fqn}."
+            )
+            worker_builder_cls_fqn = extension_fqn
+
+        # Validate world_size compatibility with parallelism configuration
+        model_parallel_size = pp_size * cp_size * tp_size
+        actual_world_size = cluster.world_size()
+
+        if (
+            not bool(os.environ.get("NRL_IGNORE_TP_ACCURACY_CHECK"))
+            and "logprob_batch_size" in config
+            and tp_size >= 4
+        ):
+            sep_line = "\n" + ("-" * 80)
+            assert config["train_micro_batch_size"] == config["logprob_batch_size"], (
+                f"{sep_line}\n"
+                "There is a known batch-variant accuracy issue with TP>=4 for both Automodel and Megatron backend.\n"
+                "See https://docs.nvidia.com/nemo/rl/latest/guides/automodel-tp-accuracy.html#root-cause for more details.\n"
+                "\n"
+                "Please choose either of the following solutions to avoid this issue:\n"
+                "1. Set tp_size to 1 or 2. (tensor_parallel_size for Automodel, or tensor_model_parallel_size for Megatron)\n"
+                "2. Set policy.train_micro_batch_size and policy.logprob_batch_size to be the same value.\n"
+                "3. Set loss_fn.force_on_policy_ratio=true to force ratio=1.0, this requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt.\n"
+                "4. Set NRL_IGNORE_TP_ACCURACY_CHECK=1 to bypass this check. (not recommended)"
+                f"{sep_line}\n"
+            )
+
+        if actual_world_size < model_parallel_size:
+            raise ValueError(
+                f"World size ({actual_world_size}) is insufficient for the parallelism configuration. "
+                f"Required minimum world size: PP({pp_size}) * CP({cp_size}) * TP({tp_size}) = {model_parallel_size}. "
+                f"This would result in DP = {actual_world_size}/{model_parallel_size} = {actual_world_size / model_parallel_size:.3f}, but DP must be ≥ 1. "
+                f"Please either increase the number of GPUs/nodes or reduce the parallelism parameters."
+            )
+
+        if actual_world_size % model_parallel_size != 0:
+            dp_size_float = actual_world_size / model_parallel_size
+            raise ValueError(
+                f"World size ({actual_world_size}) must be divisible by PP * CP * TP ({model_parallel_size}). "
+                f"The data parallel size (DP = world_size / (PP * CP * TP)) must be a positive integer. "
+                f"Current DP would be {actual_world_size}/{model_parallel_size} = {dp_size_float:.6f}, which is not an integer. "
+                f"Please adjust your cluster size or parallelism parameters."
+            )
+
+        self.sharding_annotations = NamedSharding(
+            layout=np.arange(cluster.world_size()).reshape(
+                pp_size,  # PP
+                -1,  # DP
+                cp_size,  # CP
+                tp_size,  # TP
+            ),
+            names=[
+                "pipeline_parallel",
+                "data_parallel",
+                "context_parallel",
+                "tensor_parallel",
+            ],
+        )
+
+        pre_init_queue = RayQueue()
+
+        worker_kwargs = dict(
+            init_optimizer=init_optimizer,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
+            init_reference_model=init_reference_model,
+            worker_sharding_annotations=self.sharding_annotations,
+            pre_init_communication_queue=pre_init_queue,
+        )
+        if megatron_enabled:
+            worker_kwargs["is_refit_destination"] = is_refit_destination
+        elif is_refit_destination:
+            raise ValueError("is_refit_destination=True requires the Megatron backend.")
+        if skip_weight_load:
+            worker_kwargs["skip_weight_load"] = True
+        if reserved_http_server_ports is not None:
+            worker_kwargs["reserved_http_server_ports"] = reserved_http_server_ports
+
+        if automodel_enabled:
+            # Automodel workers reconstruct tokenizer/processor locally to avoid
+            # pickling across incompatible transformers versions (v4 head → v5 worker).
+            config["tokenizer"]["use_processor"] = processor is not None
+        else:
+            worker_kwargs["tokenizer"] = tokenizer
+            worker_kwargs["processor"] = processor
+
+        worker_builder = RayWorkerBuilder(
+            worker_builder_cls_fqn,
+            config,
+            **worker_kwargs,
+        )
+
+        if cluster._sorted_bundle_indices is not None:
+            # The cluster has initialized a unified placemenet group across nodes
+            # In this case, we need to create workers based on sorted bundle indices
+            group_size = cluster.num_gpus_per_node
+            tied_groups = [
+                (i // group_size, [bundle_idx])
+                for i, bundle_idx in enumerate(cluster._sorted_bundle_indices)
+            ]
+
+            self.worker_group = RayWorkerGroup(
+                cluster,
+                worker_builder,
+                name_prefix=name_prefix,
+                bundle_indices_list=tied_groups,
+                sharding_annotations=self.sharding_annotations,
+                env_vars=env_vars or {},
+            )
+
+        else:
+            self.worker_group = RayWorkerGroup(
+                cluster,
+                worker_builder,
+                name_prefix=name_prefix,
+                workers_per_node=workers_per_node,
+                sharding_annotations=self.sharding_annotations,
+                env_vars=env_vars or {},
+            )
+
+        if config["dynamic_batching"]["enabled"]:
+            assert pp_size == 1, (
+                "Dynamic batching is only supported for single pipeline parallel stage"
+            )
+            self.use_dynamic_batches = True
+            self.dynamic_batching_args: DynamicBatchingArgs = {
+                "input_key": "input_ids",
+                "input_lengths_key": "input_lengths",
+                "sequence_length_round": config["dynamic_batching"][
+                    "sequence_length_round"
+                ],
+                "max_tokens_per_microbatch": 0,  # Override this in each different call (presumably different sizes)
+            }
+            assert not config["sequence_packing"]["enabled"], (
+                "Dynamic Batching is exclusive of Sequence Packing. Please disable Sequence Packing to use Dynamic Batching"
+            )
+        else:
+            self.use_dynamic_batches = False
+
+        # initialize FLOPs tracker
+        try:
+            if hf_config is None:
+                hf_config = get_hf_config(
+                    config["model_name"],
+                    **hf_config_overrides,
+                )
+            self.flops_tracker = FLOPTracker.from_config(
+                config["model_name"],
+                hf_config,
+            )
+        except ValueError as e:
+            self.flops_tracker = None
+            print(f"FLOPS tracker not supported for model {config['model_name']}: {e}")
+
+        if config["sequence_packing"]["enabled"]:
+            self.use_sequence_packing = True
+            sequence_length_pad_multiple = config["make_sequence_length_divisible_by"]
+            self.sequence_packing_args: SequencePackingArgs = {
+                "algorithm": config["sequence_packing"]["algorithm"],
+                "input_key": "input_ids",
+                "input_lengths_key": "input_lengths",
+                "sequence_length_pad_multiple": sequence_length_pad_multiple,
+            }
+            microbatch_order = config["sequence_packing"].get("microbatch_order")
+            if microbatch_order is not None:
+                self.sequence_packing_args["microbatch_order"] = microbatch_order
+            if pair_grouping_key := config["sequence_packing"].get("pair_grouping_key"):
+                self.sequence_packing_args["pair_grouping_key"] = pair_grouping_key
+            if (
+                max_sequences_per_bin := config["sequence_packing"].get(
+                    "max_sequences_per_bin"
+                )
+            ) is not None:
+                self.sequence_packing_args["max_sequences_per_bin"] = (
+                    max_sequences_per_bin
+                )
+            assert not config["dynamic_batching"]["enabled"], (
+                "Sequence Packing is exclusive of Dynamic Batching. Please disable Dynamic Batching"
+            )
+        else:
+            self.use_sequence_packing = False
+
+        self.cfg = config
+
+    @property
+    def data_parallel_size(self) -> int:
+        """Data-parallel degree, read from the policy's sharding annotations."""
+        return self.sharding_annotations.get_axis_size("data_parallel")
+
+    def run_all_workers_single_data(self, method_name: str, *args, **kwargs) -> Any:
+        """Run a method on all workers in parallel with the same data.
+
+        Mainly used for worker extension classes.
+
+        Args:
+            method_name: The name of the method to run.
+            *args: The positional arguments to pass to the method.
+            **kwargs: The keyword arguments to pass to the method.
+
+        Returns:
+            The results of the method run on all workers.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name, *args, **kwargs
+        )
+        results = ray.get(futures)
+        return results
+
+    def run_all_workers_multiple_data(self, method_name: str, *args, **kwargs) -> Any:
+        """Run a method on all workers in parallel with different data.
+
+        Mainly used for worker extension classes.
+
+        Args:
+            method_name: The name of the method to run.
+            *args: The positional arguments to pass to the method.
+            **kwargs: The keyword arguments to pass to the method.
+
+        Returns:
+            The results of the method run on all workers.
+        """
+        futures = self.worker_group.run_all_workers_multiple_data(
+            method_name, *args, **kwargs
+        )
+        results = ray.get(futures)
+        return results
+
+    def init_collective(
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
+        rank_offset: int = 0,
+        nccl_peer: str = "nemo",
+    ) -> list[ray.ObjectRef]:
+        """Initialize the collective communication."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "init_collective",
+            ip=ip,
+            port=port,
+            world_size=world_size,
+            train_world_size=train_world_size,
+            rank_offset=rank_offset,
+            nccl_peer=nccl_peer,
+        )
+        # this function should co-work with vllm, so we should wait for all futures to complete outside
+        return futures
+
+    def init_collective_mcore_generation(
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        rank_offset: int,
+        refit_execution_batch_bytes: int | None,
+        refit_backend: str,
+    ) -> list[ray.ObjectRef]:
+        """Initialize the megatron refit collective on this policy's workers."""
+        return self.worker_group.run_all_workers_single_data(
+            "init_collective_mcore_generation",
+            ip=ip,
+            port=port,
+            world_size=world_size,
+            rank_offset=rank_offset,
+            refit_execution_batch_bytes=refit_execution_batch_bytes,
+            refit_backend=refit_backend,
+        )
+
+    def preinit_nvshmem(self) -> list[ray.ObjectRef]:
+        """Pre-initialize NVSHMEM on this policy's workers (no-op when not using nvshmem)."""
+        return self.worker_group.run_all_workers_single_data(
+            "preinit_nvshmem_collective"
+        )
+
+    def swap_weights_via_reshard(self, *, is_source: bool) -> list[ray.ObjectRef]:
+        """Send (`is_source=True`) or receive (`is_source=False`) weights via megatron reshard."""
+        return self.worker_group.run_all_workers_single_data(
+            "swap_weights_via_reshard",
+            is_source=is_source,
+        )
+
+    # ── DP-shard helpers ────────────────────────────────────────────────
+    # DRY for Policy's logprob/train methods only. The data-plane sibling
+    # TQPolicy shards KVBatchMeta via ``shard_meta_for_dp``; the
+    # driver-on-data vs driver-on-meta split is by design.
+    def _shard_for_logprob(
+        self,
+        data: BatchedDataDict[Any],
+    ) -> tuple[list["SlicedDataDict"], Optional[list[int]]]:
+        """Shard inputs for ``get_logprobs`` / ``get_reference_policy_logprobs``.
+
+        Mirrors the legacy shard block (lines 426-450 / 503-530). Returns
+        ``(sharded_data, unsorted_data_indices)`` where the second element
+        is the inverse permutation needed to undo seqpack/dynbatch reorder
+        (``None`` when neither is enabled).
+        """
+        dp_size = self.data_parallel_size
+        if self.use_dynamic_batches:
+            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                "dynamic_batching"
+            ]["logprob_mb_tokens"]
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+                dynamic_batching_args=self.dynamic_batching_args,
+            )
+        elif self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["logprob_mb_tokens"]
+            # we just shard into DP shards here as Sequence packing allows for CP.
+            sharded_data, unsorted_data_indices = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+                sequence_packing_args=self.sequence_packing_args,
+            )
+        else:
+            sharded_data = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+            )
+            unsorted_data_indices = None
+        return sharded_data, unsorted_data_indices
+
+    def _shard_for_train(
+        self,
+        data: BatchedDataDict[Any],
+        batch_size: int,
+        *,
+        micro_batch_size: Optional[int] = None,
+    ) -> list["SlicedDataDict"]:
+        """Shard inputs for ``train``.
+
+        Mirrors the legacy shard block (lines 706-729). Note vs.
+        ``_shard_for_logprob``: uses ``train_mb_tokens`` (not
+        ``logprob_mb_tokens``), passes ``batch_size`` (not None), and
+        does not return ``unsorted_data_indices`` because train returns
+        scalar metrics (no per-row outputs to reorder).
+        """
+        dp_size = self.data_parallel_size
+        if is_direct_packed_row(data):
+            missing = _DIRECT_PACKED_SFT_REQUIRED_KEYS.difference(data)
+            if missing:
+                raise ValueError(
+                    "Direct packed SFT batch is missing required fields: "
+                    f"{sorted(missing)}"
+                )
+            if (
+                "megatron_cfg" not in self.cfg
+                or not self.cfg["megatron_cfg"]["enabled"]
+            ):
+                raise ValueError("Direct packed SFT rows require the Megatron backend")
+            if "draft" in self.cfg and self.cfg["draft"]["enabled"]:
+                raise NotImplementedError(
+                    "Direct packed SFT rows do not support draft training"
+                )
+            effective_micro_batch_size = (
+                micro_batch_size
+                if micro_batch_size is not None
+                else self.cfg["train_micro_batch_size"]
+            )
+            if effective_micro_batch_size != 1:
+                raise ValueError("Direct packed SFT rows require micro batch size 1")
+            if self.cfg["dynamic_batching"]["enabled"]:
+                raise ValueError(
+                    "Direct packed SFT rows require dynamic batching to be disabled"
+                )
+            if batch_size != data.size:
+                raise ValueError(
+                    "Direct packed SFT global batch size must equal the packed row "
+                    f"count: gbs={batch_size}, rows={data.size}"
+                )
+            if batch_size % dp_size != 0:
+                raise ValueError(
+                    "Direct packed SFT global batch size must be divisible by data "
+                    f"parallel size: gbs={batch_size}, dp={dp_size}"
+                )
+            sharded_data = [
+                SlicedDataDict(
+                    data.select_indices(list(range(dp_rank, data.size, dp_size)))
+                )
+                for dp_rank in range(dp_size)
+            ]
+        elif self.use_dynamic_batches:
+            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                "dynamic_batching"
+            ]["train_mb_tokens"]
+            sharded_data, _ = data.shard_by_batch_size(
+                dp_size,
+                batch_size=batch_size,
+                dynamic_batching_args=self.dynamic_batching_args,
+            )
+        elif self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["train_mb_tokens"]
+            sharded_data, _ = data.shard_by_batch_size(
+                dp_size,
+                batch_size=batch_size,
+                sequence_packing_args=self.sequence_packing_args,
+            )
+        else:
+            sharded_data = data.shard_by_batch_size(
+                dp_size,
+                batch_size=batch_size,
+            )
+        return sharded_data
+
+    def _report_sharded_payload(
+        self,
+        sharded_data: list["SlicedDataDict"],
+        boundary: str,
+    ) -> None:
+        """Measure the exact unique per-DP-shard Ray arguments."""
+        if not self.debug_payload_metrics:
+            return
+        print_multimodal_payload_metrics(
+            collect_sharded_multimodal_payload_metrics(
+                sharded_data,
+                boundary,
+                enabled=True,
+            )
+        )
+
+    def get_logprobs(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        timer: Optional[Timer] = None,
+    ) -> BatchedDataDict[LogprobOutputSpec]:
+        """Get the logprobs of the model for a data dict.
+
+        Returns:
+          a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
+          We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
+          The logprob of input token i is specified at position i in the output logprobs tensor.
+        """
+        with timer.time("get_logprobs/shard_data") if timer else nullcontext():
+            sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
+        self._report_sharded_payload(sharded_data, "policy_get_logprobs")
+
+        with (
+            timer.time("get_logprobs/submit_logprob_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "get_logprobs",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+            )
+        logprobs: BatchedDataDict[LogprobOutputSpec] = BatchedDataDict.from_batches(
+            self.worker_group.get_all_worker_results(futures)
+        )
+
+        # dynamic batching sorts the inputs by sequence length to improve load balancing,
+        # so change it back here
+        if unsorted_data_indices is not None:
+            logprobs.reorder_data(unsorted_data_indices)
+
+        return logprobs
+
+    def get_reference_policy_logprobs(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
+        """Get the logprobs of the reference policy for a data dict.
+
+        Returns: Identical to get_logprobs.
+        """
+        with (
+            timer.time("get_reference_policy_logprobs/shard_data")
+            if timer
+            else nullcontext()
+        ):
+            sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
+        self._report_sharded_payload(sharded_data, "policy_get_reference_logprobs")
+
+        with (
+            timer.time(
+                "get_reference_policy_logprobs/submit_reference_policy_logprob_futures"
+            )
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "get_reference_policy_logprobs",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={"micro_batch_size": micro_batch_size},
+            )
+        logprobs: BatchedDataDict[ReferenceLogprobOutputSpec] = (
+            BatchedDataDict.from_batches(
+                self.worker_group.get_all_worker_results(futures)
+            )
+        )
+
+        # dynamic batching sorts the inputs by sequence length to improve load balancing,
+        # so change it back here
+        if unsorted_data_indices is not None:
+            logprobs.reorder_data(unsorted_data_indices)
+
+        return logprobs
+
+    def get_topk_logits(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
+        with timer.time("get_topk_logits/shard_data") if timer else nullcontext():
+            sharded_data, unsorted_data_indices = self._shard_for_logprob(data)
+
+        with (
+            timer.time("get_topk_logits/submit_topk_logits_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "get_topk_logits",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+            )
+
+        # Avoid BatchedDataDict.from_batches here because it flattens rows for tensors with ndim>2 ([B,S,k] -> [B,S*k]).
+        worker_batches = self.worker_group.get_all_worker_results(futures)
+        all_topk_logits = [wb["topk_logits"] for wb in worker_batches]
+        all_topk_indices = [wb["topk_indices"] for wb in worker_batches]
+
+        stacked: BatchedDataDict[TopkLogitsOutputSpec] = BatchedDataDict()
+        stacked["topk_logits"] = torch.cat(all_topk_logits, dim=0)
+        stacked["topk_indices"] = torch.cat(all_topk_indices, dim=0)
+
+        if unsorted_data_indices is not None:
+            stacked.reorder_data(unsorted_data_indices)
+
+        return stacked
+
+    def get_full_logits_ipc(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> list[dict[str, Any]]:
+        """Ship the teacher's full-vocab logits to the student via CUDA IPC.
+
+        Used by cross-tokenizer distillation; supports heterogeneous teacher
+        TP/CP. Gathers each worker's ``{"dp_rank", "per_sample_handles"}`` and
+        returns the global-batch-ordered list produced by
+        :func:`aggregate_per_sample_handles`: a length-``gbs`` list where
+        element ``i`` is ``{"teacher_shards": [shard, ...]}`` holding every
+        TP×CP shard of global sample ``i``. Each shard carries the IPC payload
+        plus the ``buf_idx`` / ``sample_index_in_buf`` slot index and the TP/CP
+        shard metadata; the loss consumer reassembles the full ``[T_t, V_t]``
+        teacher logits (or its CP-local window) from these shards.
+
+        The producer-side IPC storage is persistent and reused across calls
+        (via ``copy_``); the caller releases it once via
+        :meth:`release_ipc_buffer` at the end of training / validation (and on
+        error), not per call.
+
+        v0 limitation: no dynamic batching, no sequence packing.
+        """
+        if self.use_dynamic_batches or self.use_sequence_packing:
+            raise NotImplementedError(
+                "get_full_logits_ipc does not support dynamic batching "
+                "or sequence packing in v0."
+            )
+        dp_size = self.data_parallel_size
+        with timer.time("get_full_logits_ipc/shard_data") if timer else nullcontext():
+            sharded_data = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+            )
+        with timer.time("get_full_logits_ipc/submit") if timer else nullcontext():
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "get_full_logits_ipc",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                # Keep every TP × CP output; consumer routes via overlap.
+                output_is_replicated=["pipeline_parallel"],
+                common_kwargs={"micro_batch_size": micro_batch_size},
+            )
+        worker_results = self.worker_group.get_all_worker_results(futures)
+        return aggregate_per_sample_handles(worker_results)
+
+    def release_ipc_buffer(self) -> None:
+        """Tell all workers to drop their stashed IPC tensors."""
+        futures = self.worker_group.run_all_workers_single_data("release_ipc_buffer")
+        ray.get(futures)
+
+    def train(
+        self,
+        data: BatchedDataDict[Any],
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        timer: Optional[Timer] = None,
+        check_dim_skip_keys: Optional[Iterable[str]] = None,
+    ) -> dict[str, Any]:
+        """Train the policy on a batch of data with a given loss function.
+
+        Args:
+            check_dim_skip_keys: Keys whose tensors are not student-sequence-aligned at
+                dim 1 and must be excluded from the worker's sequence-dim
+                pre-flight check. Used by cross-tokenizer distillation to
+                pass through teacher / alignment auxiliaries that ride on
+                the same data dict.
+        """
+        batch_size = gbs or self.cfg["train_global_batch_size"]
+        micro_batch_size = mbs or self.cfg["train_micro_batch_size"]
+        # Shard and replicate the batch
+        with timer.time("policy_training/sharding_data") if timer else nullcontext():
+            if is_direct_packed_row(data):
+                sharded_data = self._shard_for_train(
+                    data,
+                    batch_size,
+                    micro_batch_size=micro_batch_size,
+                )
+            else:
+                sharded_data = self._shard_for_train(data, batch_size)
+        self._report_sharded_payload(sharded_data, "policy_train")
+
+        if self.flops_tracker is not None:
+            self.flops_tracker.reset()
+            for shard in sharded_data:
+                input_lengths = shard["input_lengths"]
+                self.flops_tracker.track_batch(input_lengths.tolist())
+
+        # Train each shard in parallel
+        with (
+            timer.time("policy_training/submit_training_futures")
+            if timer
+            else nullcontext()
+        ):
+            futures = self.worker_group.run_all_workers_sharded_data(
+                "train",
+                data=sharded_data,
+                in_sharded_axes=["data_parallel"],
+                replicate_on_axes=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                output_is_replicated=[
+                    "context_parallel",
+                    "tensor_parallel",
+                    "pipeline_parallel",
+                ],
+                common_kwargs={
+                    "loss_fn": loss_fn,
+                    "eval_mode": eval_mode,
+                    "gbs": batch_size,
+                    "mbs": micro_batch_size,
+                    "check_dim_skip_keys": check_dim_skip_keys,
+                },
+            )
+        results = self.worker_group.get_all_worker_results(futures)
+
+        # Aggregate the results
+        aggregated_results = {
+            "loss": results[0]["global_loss"],
+            "grad_norm": results[0]["grad_norm"],
+        }
+        if "moe_metrics" in results[0]:
+            aggregated_results["moe_metrics"] = results[0]["moe_metrics"]
+        if "mtp_metrics" in results[0]:
+            aggregated_results["mtp_metrics"] = results[0]["mtp_metrics"]
+        if "draft_grad_norm" in results[0]:
+            aggregated_results["draft_grad_norm"] = results[0]["draft_grad_norm"]
+
+        if self.flops_tracker is not None:
+            aggregated_results["total_flops"] = self.flops_tracker.total_flops
+            aggregated_results["num_ranks"] = self.worker_group.cluster.world_size()
+            gpus_per_worker = self.worker_group.cluster.world_size() / len(results)
+
+            try:
+                aggregated_results["theoretical_tflops"] = gpus_per_worker * sum(
+                    get_theoretical_tflops(r["gpu_name"], r["model_dtype"])
+                    for r in results
+                )
+            except Exception as e:
+                warnings.warn(f"Error getting theoretical flops: {e}")
+        elif results and "total_flops" in results[0]:
+            aggregated_results.update(
+                _aggregate_megatron_flops_metrics(
+                    results, self.worker_group.cluster.world_size()
+                )
+            )
+
+        # Aggregate metrics across all workers
+        all_mb_metrics = defaultdict(list)
+        for r in results:
+            for k, v in r["all_mb_metrics"].items():
+                all_mb_metrics[k].extend(v)
+        aggregated_results["all_mb_metrics"] = dict(all_mb_metrics)
+
+        return aggregated_results
+
+    def generate(
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    ) -> BatchedDataDict[GenerationOutputSpec]:
+        """Generate a batch of data using the policy."""
+        assert isinstance(data, BatchedDataDict), (
+            f"data must be a BatchedDataDict, got type: {type(data)}"
+        )
+        assert "input_ids" in data and "input_lengths" in data, (
+            "Missing required input fields"
+        )
+        assert self.cfg["generation"] is not None, "Generation config is not set"
+
+        dp_size = self.data_parallel_size
+        sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "generate",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=["tensor_parallel", "pipeline_parallel"],
+            output_is_replicated=["tensor_parallel", "pipeline_parallel"],
+            common_kwargs={"greedy": greedy},
+        )
+        result = BatchedDataDict.from_batches(
+            self.worker_group.get_all_worker_results(futures),
+            pad_value_dict={"output_ids": self.cfg["generation"]["_pad_token_id"]},
+        )
+
+        required_keys = [
+            "output_ids",
+            "generation_lengths",
+            "unpadded_sequence_lengths",
+            "logprobs",
+        ]
+        missing_keys = [key for key in required_keys if key not in result]
+        if missing_keys:
+            raise ValueError(
+                f"Missing required keys for GenerationOutputSpec: {missing_keys}"
+            )
+
+        return result
+
+    def score(
+        self, data: BatchedDataDict[GenerationDatumSpec]
+    ) -> BatchedDataDict[ScoreOutputSpec]:
+        """Score a batch of data using the policy."""
+        # Verify input data is right-padded
+        assert isinstance(data, BatchedDataDict), (
+            f"data must be a BatchedDataDict, got type: {type(data)}"
+        )
+        assert "input_ids" in data and "input_lengths" in data, (
+            "Missing required input fields"
+        )
+
+        dp_size = self.data_parallel_size
+        sharded_data = data.shard_by_batch_size(dp_size, batch_size=None)
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "score",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={},
+        )
+
+        result: BatchedDataDict[ScoreOutputSpec] = BatchedDataDict.from_batches(
+            self.worker_group.get_all_worker_results(futures),
+        )
+        required_keys = [
+            "scores",
+        ]
+        missing_keys = [key for key in required_keys if key not in result]
+        if missing_keys:
+            raise ValueError(
+                f"Missing required keys for ScoreOutputSpec: {missing_keys}"
+            )
+
+        return result
+
+    def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
+        # We don't need to do anything here
+        return True
+
+    def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
+        # We don't need to do anything here
+        return True
+
+    def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
+        # onload everything to the GPU
+        futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
+        ray.get(futures)
+
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        """Put every worker in eval mode for logprob inference.
+
+        Args:
+            keep_train_buffers: Leave grad buffers and optimizer state on CUDA.
+                Set this when a train step is already open, so that gradients
+                accumulated by earlier streaming chunks survive; see
+                ``MegatronPolicyWorker.prepare_for_lp_inference``.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "prepare_for_lp_inference", keep_train_buffers=keep_train_buffers
+        )
+        ray.get(futures)
+
+    def invalidate_kv_cache(self, *args: Any, **kwargs: Any) -> bool:
+        # We don't need to do anything here
+        return True
+
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+        """Prepare the info for refit.
+
+        Returns:
+            dict: A dictionary containing the info for refit.
+        """
+        futures = self.worker_group.run_all_workers_single_data("prepare_refit_info")
+        results = ray.get(futures)
+        # Only get the first worker's info since all workers will have the same result
+        return results[0]
+
+    def enable_refit_prequantize(
+        self, param_names: list[str]
+    ) -> Optional[dict[str, Any]]:
+        """Enable trainer-side MXFP8 quantization of the listed params for refit.
+
+        Returns:
+            dict: Refit info updated with quantized dtypes and scale entries.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "enable_refit_prequantize", param_names=param_names
+        )
+        results = ray.get(futures)
+        return results[0]
+
+    def finish_inference(self) -> None:
+        """Offload policy model to CPU after inference."""
+        futures = self.worker_group.run_all_workers_single_data("finish_inference")
+        ray.get(futures)
+
+    def finish_training(self, *args: Any, **kwargs: Any) -> None:
+        # Placeholder implementation
+        pass
+
+    def calibrate_qkv_fp8_scales(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """Trigger KV-cache FP8 scale calibration across Megatron workers and return results.
+
+        Note: The backend `MegatronPolicyWorker.calibrate_qkv_fp8_scales` already implements
+        distributed reduction, returning results merged across ranks. Therefore, we shard the
+        input by DP and call in parallel, then take the result from the first worker.
+        """
+        dp_size = self.data_parallel_size
+        if self.use_dynamic_batches:
+            self.dynamic_batching_args["max_tokens_per_microbatch"] = self.cfg[
+                "dynamic_batching"
+            ]["logprob_mb_tokens"]
+            sharded_data, _ = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+                dynamic_batching_args=self.dynamic_batching_args,
+            )
+        elif self.use_sequence_packing:
+            self.sequence_packing_args["max_tokens_per_microbatch"] = self.cfg[
+                "sequence_packing"
+            ]["logprob_mb_tokens"]
+            sharded_data, _ = data.shard_by_batch_size(
+                dp_size,
+                batch_size=None,
+                sequence_packing_args=self.sequence_packing_args,
+            )
+        else:
+            sharded_data = data.shard_by_batch_size(  # type: ignore
+                dp_size,
+                batch_size=None,
+            )
+        self._report_sharded_payload(sharded_data, "policy_kv_calibration")
+
+        futures = self.worker_group.run_all_workers_sharded_data(
+            "calibrate_qkv_fp8_scales",
+            data=sharded_data,
+            in_sharded_axes=["data_parallel"],
+            replicate_on_axes=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            output_is_replicated=[
+                "context_parallel",
+                "tensor_parallel",
+                "pipeline_parallel",
+            ],
+            common_kwargs={
+                "micro_batch_size": micro_batch_size,
+                "percentile": percentile,
+                "margin": margin,
+                "include_q": include_q,
+            },
+        )
+        results = self.worker_group.get_all_worker_results(futures)
+        return results[0]
+
+    def get_free_memory_bytes(self) -> int:
+        """Get the available free memory."""
+        futures = self.worker_group.run_all_workers_single_data("get_free_memory_bytes")
+        # minimum free memory from all workers for safety
+        free_memory_bytes = min(ray.get(future) for future in futures)
+        return free_memory_bytes
+
+    def stream_weights_via_ipc_zmq(
+        self, buffer_size_bytes: int, kv_scales: Optional[dict[str, float]] = None
+    ) -> list[ray.ObjectRef]:
+        """Send the weights for IPC handles via ZMQ socket."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "stream_weights_via_ipc_zmq",
+            buffer_size_bytes=buffer_size_bytes,
+            kv_scales=kv_scales,
+        )
+        return futures
+
+    def connect_sglang_rollout_engines(
+        self,
+        *,
+        engine_gpu_counts: list[int],
+        engine_gpu_offsets: Optional[list[int]] = None,
+    ) -> None:
+        """Set up the colocate Gloo gather topology for SGLang weight refit.
+
+        Called by the SGLang colocated refit drivers (Megatron and Automodel)
+        whenever engines are added or recovered.
+        """
+        futures = self.worker_group.run_all_workers_single_data(
+            "connect_sglang_rollout_engines",
+            engine_gpu_counts=engine_gpu_counts,
+            engine_gpu_offsets=engine_gpu_offsets,
+        )
+        ray.get(futures)
+
+    def update_weights_to_sglang_colocated(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Send Megatron-restored HF tensors to colocated SGLang via Ray IPC."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "update_weights_to_sglang_colocated",
+            rollout_engines=rollout_engines,
+            buffer_size_bytes=buffer_size_bytes,
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
+        )
+        return futures
+
+    def connect_sglang_rollout_engines_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        engine_gpu_counts: list[int],
+        group_name: Optional[str] = None,
+    ) -> None:
+        """Bring up the trainer-rank-0 NCCL group for SGLang disaggregate refit."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "connect_sglang_rollout_engines_distributed",
+            rollout_engines=rollout_engines,
+            engine_gpu_counts=engine_gpu_counts,
+            group_name=group_name,
+        )
+        ray.get(futures)
+
+    def update_weights_to_sglang_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        rollout_engine_lock: ray.actor.ActorHandle,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
+        """Broadcast Megatron-restored HF tensors to SGLang via NCCL (rank 0 only)."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "update_weights_to_sglang_distributed",
+            rollout_engines=rollout_engines,
+            rollout_engine_lock=rollout_engine_lock,
+            buffer_size_bytes=buffer_size_bytes,
+            target_precision=target_precision,
+            sglang_quantization_cfg=sglang_quantization_cfg,
+        )
+        return futures
+
+    def broadcast_weights_for_collective(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
+    ) -> list[ray.ObjectRef]:
+        """Broadcast the weights for collective communication."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "broadcast_weights_for_collective",
+            kv_scales=kv_scales,
+            refit_timeout_s=refit_timeout_s,
+            buffer_size_bytes=buffer_size_bytes,
+            num_buffers=num_buffers,
+            use_legacy_packing=use_legacy_packing,
+        )
+        # this function should co-work with vllm, so we should wait for all futures to complete outside
+        return futures
+
+    def init_nccl_reshard_comm_group(
+        self,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        pp_stages: list[int],
+        sub_world_size: int,
+        ranks_in_group: list[int],
+    ) -> list[ray.ObjectRef]:
+        """Initialize the nccl_reshard bulk-path comm group on all train workers."""
+        futures = self.worker_group.run_all_workers_multiple_data(
+            "init_nccl_reshard_comm_group",
+            my_pp_stage=pp_stages,
+            my_rank_in_group=ranks_in_group,
+            common_kwargs={
+                "pp_ips": pp_ips,
+                "pp_ports": pp_ports,
+                "pp_size": pp_size,
+                "sub_world_size": sub_world_size,
+            },
+        )
+        # co-works with vllm; wait for all futures to complete outside
+        return futures
+
+    def prepare_nccl_reshard_refit_info(
+        self,
+        train_parallelism: dict[str, Any],
+        gen_parallelism: dict[str, Any],
+        train_world_size: int,
+        gen_world_size: int,
+    ) -> dict[str, Any]:
+        """Prepare per-layer param metadata for nccl_reshard refit."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "prepare_nccl_reshard_refit_info",
+            train_parallelism=train_parallelism,
+            gen_parallelism=gen_parallelism,
+            train_world_size=train_world_size,
+            gen_world_size=gen_world_size,
+        )
+        results = ray.get(futures)
+        return results[0]
+
+    def nccl_reshard_refit(
+        self, kv_scales=None, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
+        """Transfer weights to gen workers via nccl_reshard (xferdtensor)."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "nccl_reshard_refit",
+            kv_scales=kv_scales,
+            refit_timeout_s=refit_timeout_s,
+        )
+        return futures
+
+    def sync_params_before_refit(self) -> None:
+        """Materialize the latest parameters on every policy worker before refit."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "sync_params_before_refit"
+        )
+        ray.get(futures)
+
+    def offload_before_refit(self) -> None:
+        """Offload the optimizer and buffers to the CPU."""
+        futures = self.worker_group.run_all_workers_single_data("offload_before_refit")
+        ray.get(futures)
+
+    def offload_after_refit(self) -> None:
+        """Offload the optimizer and buffers to the CPU."""
+        futures = self.worker_group.run_all_workers_single_data("offload_after_refit")
+        ray.get(futures)
+
+    def offload_to_cpu(self) -> None:
+        """Offload to CPU to free GPU memory; currently only used by PPO."""
+        self.offload_after_refit()
+
+    def save_checkpoint(
+        self,
+        weights_path: str,
+        optimizer_path: Optional[str] = None,
+        tokenizer_path: Optional[str] = None,
+        *,
+        is_final_checkpoint: bool,
+    ) -> None:
+        """Save a checkpoint of the model.
+
+        With Megatron async_save=True, this returns after D2H staging. The caller
+        must call finalize_async_save() before renaming the checkpoint directory.
+
+        Automodel checkpoint resources are configured when the Policy is
+        constructed. ``weights_path`` selects the destination for each save.
+        """
+        if bool(self.cfg.get("automodel_cfg", {}).get("enabled", False)):
+            futures = self.worker_group.run_all_workers_single_data(
+                "save_checkpoint",
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                tokenizer_path=tokenizer_path,
+                is_final_checkpoint=is_final_checkpoint,
+            )
+        else:
+            futures = self.worker_group.run_all_workers_single_data(
+                "save_checkpoint",
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                tokenizer_path=tokenizer_path,
+            )
+        ray.get(futures)
+
+    def finalize_async_save(self) -> None:
+        """Block until all workers' in-flight async checkpoint writes complete.
+
+        No-op when async_save is disabled. Must be called before the checkpoint
+        directory is renamed from tmp_step_N/ to step_N/.
+        """
+        futures = self.worker_group.run_all_workers_single_data("finalize_async_save")
+        ray.get(futures)
+
+    def shutdown(self) -> bool:
+        """Shut down all HF workers and clean up resources."""
+        if not hasattr(self, "worker_group"):
+            return True
+        try:
+            # Use the worker group's shutdown method with the worker's cleanup method
+            return self.worker_group.shutdown(cleanup_method="shutdown")
+        except ray.exceptions.RayActorError:
+            # Workers already dead (e.g., shut down via another handle to the same actors).
+            return True
+        except Exception as e:
+            print(f"Error during policy shutdown: {e}")
+            return False
+
+    def __del__(self) -> None:
+        """Shuts down the worker groups when the object is deleted or is garbage collected.
+
+        This is an extra safety net in case the user forgets to call shutdown() and the pointer to
+        the object is lost due to leaving a function scope. It's always recommended that the
+        user calls shutdown().
+        """
+        self.shutdown()
+
+    def start_gpu_profiling(self) -> None:
+        """Start GPU profiling."""
+        futures = self.worker_group.run_all_workers_single_data("start_gpu_profiling")
+        ray.get(futures)
+
+    def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling."""
+        futures = self.worker_group.run_all_workers_single_data("stop_gpu_profiling")
+        ray.get(futures)
+
+    def print_node_ip_and_gpu_id(self) -> list[tuple[str, int]]:
+        """Print the node IP and GPU ID of the current worker."""
+        results = ray.get(
+            self.worker_group.run_all_workers_single_data(
+                "report_node_ip_and_gpu_id",
+            )
+        )
+        all_node_ips = sorted(set([result[0] for result in results]))
+        all_gpu_ids = sorted(set([result[1] for result in results]))
+
+        worker_id_list = [
+            [list() for _ in range(len(all_gpu_ids))] for _ in range(len(all_node_ips))
+        ]
+        for worker_id, (ip, gpu_id) in enumerate(results):
+            node_idx = all_node_ips.index(ip)
+            gpu_idx = all_gpu_ids.index(gpu_id)
+            worker_id_list[node_idx][gpu_idx].append("worker-" + str(worker_id))
+
+        from prettytable import PrettyTable
+
+        table = PrettyTable()
+        table.title = "Policy worker mapping to Nodes and GPUs"
+        table.field_names = ["Node_IP"] + [
+            "GPU_ID=" + str(gpu_id) for gpu_id in all_gpu_ids
+        ]
+        for i, node_idx in enumerate(all_node_ips):
+            row = [node_idx]
+            for j in range(len(all_gpu_ids)):
+                row.append(tuple(worker_id_list[i][j]))
+            table.add_row(row)
+
+        print(table)

@@ -1,0 +1,408 @@
+# Get Started with 🤗 Hugging Face Conversion
+
+Megatron Bridge provides seamless bidirectional conversion between 🤗 Hugging Face Transformers and Megatron model definitions. This guide covers the main APIs for loading models, checking compatibility, and converting between formats.
+
+## Design and Goals
+
+- Single high-level entry point: `AutoBridge` detects HF model architectures and dispatches to the correct bridge.
+- Bidirectional conversion: Import HF → Megatron for training; export Megatron → HF for deployment.
+- Parallelism-aware: Handles TP/PP/VPP/CP/EP/ETP distributions during conversion.
+- Streaming and memory efficiency: per-parameter streaming using safetensors.
+- Provider pattern: Configure Megatron-Core `TransformerConfig`-compatible attributes before instantiation via `to_megatron_provider()`.
+- Convenience workflows: `import_ckpt` and `export_ckpt` provide one-call HF↔Megatron checkpoint flows.
+
+See the repository `README.md` for installation, supported models, and project highlights.
+
+## Loading a 🤗 Hugging Face Model into Megatron
+
+The easiest way to load a 🤗 Hugging Face model is using `AutoBridge.from_hf_pretrained()`, which automatically detects the model architecture and selects the appropriate bridge for conversion. You can then use `AutoBridge.to_megatron_model()` to initialize the Megatron model from the 🤗 Hugging Face configuration and load 🤗 Hugging Face weights at the same time.
+
+### Accessing Gated 🤗 Hugging Face Models
+
+Some models in Megatron Bridge require access to gated repositories on Hugging Face. These are models that require explicit permission from the model authors before you can download or use them.
+
+If you encounter an error like this when trying to use a model:
+
+```
+OSError: You are trying to access a gated repo.
+Make sure to have access to it at <URL>
+```
+
+Follow these steps to resolve the issue:
+
+1. **Request access**: Visit the URL provided in the error message and request access to the gated model
+2. **Generate a token**: Create a Hugging Face access token by following [this tutorial](https://huggingface.co/docs/hub/en/security-tokens#how-to-manage-user-access-tokens)
+3. **Set the environment variable**: Export your token in your environment:
+
+```bash
+export HF_TOKEN=<your_access_token>
+```
+
+### Basic Usage
+
+```python
+from megatron.bridge import AutoBridge
+
+# Load a supported model automatically
+bridge = AutoBridge.from_hf_pretrained("meta-llama/Llama-3.2-1B")
+
+# Create a provider, configure before instantiation, then build the model
+provider = bridge.to_megatron_provider()
+provider.tensor_model_parallel_size = 1
+provider.pipeline_model_parallel_size = 1
+provider.finalize()
+megatron_model = provider.provide_distributed_model(wrap_with_ddp=False)
+```
+
+### Advanced Loading Options
+You can also load models with specific settings such as precision, device placement, or by enabling trust in remote code:
+
+```python
+import torch
+from megatron.bridge import AutoBridge
+
+# Load with specific settings
+bridge = AutoBridge.from_hf_pretrained(
+    "meta-llama/Meta-Llama-3-8B",
+    torch_dtype=torch.float16,
+    device_map="auto",
+    trust_remote_code=True,
+)
+
+# Load from local path
+bridge = AutoBridge.from_hf_pretrained("/path/to/local/hf_model")
+```
+
+### Using Model Providers
+
+For more control over model configuration, use the provider pattern. The provider lets you configure any `TransformerConfig` attribute:
+
+```python
+from megatron.bridge import AutoBridge
+
+# Load a supported model automatically
+bridge = AutoBridge.from_hf_pretrained("meta-llama/Llama-3.2-1B")
+
+# Get a model provider (lazy loading)
+provider = bridge.to_megatron_provider()
+
+# Configure parallelism (multi-GPU requires torchrun or srun)
+provider.tensor_model_parallel_size = 8
+provider.pipeline_model_parallel_size = 2
+
+# Configure fusions
+provider.bias_activation_fusion = True
+provider.bias_dropout_fusion = True
+
+# Finalize the provider to run validation checks and complete initialization
+provider.finalize()
+
+# Create the model with all configurations applied
+model = provider.provide_distributed_model(wrap_with_ddp=False)
+```
+
+The provider pattern is especially useful when you need to:
+- Override default model parameters
+- Configure advanced features like MoE, activation recomputation, or mixed precision
+- Set up distributed training parameters
+
+### Using Builder-backed Model Configs
+
+Model families are migrating to the builder-backed configuration path. It keeps
+model configuration as serializable data and leaves construction to the
+family's Megatron Core `ModelBuilder`, such as `GPTModelBuilder` or
+`HybridModelBuilder`. The provider API remains available for compatibility
+while other model families migrate. Calling the legacy provider API for a
+builder-backed family emits a deprecation warning.
+
+The builder path is opt-in per family: a bridge opts in by setting
+`MODEL_CONFIG_CLASS`, which defaults to `None`. For a family that has not
+migrated, `get_model_config()` raises `ModelConfigNotSupportedError` and
+`to_megatron_provider()` remains the supported path, without a deprecation
+warning.
+
+```python
+from megatron.bridge import AutoBridge
+
+bridge = AutoBridge.from_hf_pretrained("meta-llama/Llama-3.2-1B")
+model_config = bridge.get_model_config()
+
+# Flat assignment routes declared transformer fields to the nested config.
+model_config.tensor_model_parallel_size = 1
+model_config.pipeline_model_parallel_size = 1
+
+model = bridge.get_model(
+    model_config,
+    wrap_with_ddp=False,
+)
+```
+
+Use `load_weights=False` for random initialization. A bridge created with
+`from_hf_config()` has no weights, so it requires `load_weights=False` or an
+explicit `hf_path`.
+
+Training recipes for builder-backed families store the result of
+`get_model_config()` in `ConfigContainer.model`. The training setup recognizes
+`ModelConfig` and calls its `ModelBuilder` directly; it does not create a
+legacy model provider.
+
+## Check Supported Models
+
+Before loading a model, you can check if it's supported by Megatron Bridge.
+
+You can list all supported 🤗 Hugging Face model architectures as follows:
+
+```python
+from megatron.bridge import AutoBridge
+
+# Get a list of all supported model architectures
+supported_models = AutoBridge.list_supported_models()
+
+print(f"Found {len(supported_models)} supported models:")
+for i, model in enumerate(supported_models, 1):
+    print(f"  {i:2d}. {model}")
+```
+
+Alternatively, check if a specific model is supported:
+
+```python
+from megatron.bridge import AutoBridge
+
+if AutoBridge.can_handle("meta-llama/Llama-3.2-1B"):
+    print("✅ Model is supported!")
+    bridge = AutoBridge.from_hf_pretrained("meta-llama/Llama-3.2-1B")
+else:
+    print("❌ Model requires a custom bridge implementation")
+```
+
+## Converting Back to 🤗 Hugging Face
+
+After training or modifying a Megatron model, you can convert it back to 🤗Hugging Face format for deployment or sharing. The bridge provides several methods for this conversion depending on your needs.
+
+To save the complete model including configuration, tokenizer, and weights:
+
+```python
+# Save the complete model (config, tokenizer, weights)
+bridge.save_hf_pretrained(megatron_model, "./my-fine-tuned-llama")
+
+# The saved model can be loaded with 🤗 Hugging Face
+from transformers import AutoModelForCausalLM
+hf_model = AutoModelForCausalLM.from_pretrained("./my-fine-tuned-llama")
+```
+
+You can save the model weights (safetensors):
+
+```python
+# Save just the model weights (faster, smaller)
+bridge.save_hf_weights(megatron_model, "./model_weights")
+
+# Save without progress bar (useful in scripts)
+bridge.save_hf_weights(megatron_model, "./weights", show_progress=False)
+```
+
+You can also stream weights without saving to disk during conversion for on-the-fly use in RL frameworks, for example:
+
+```python
+# Stream weights during conversion (memory efficient)
+for name, weight in bridge.export_hf_weights(megatron_model):
+    print(f"Exporting {name}: {weight.shape}")
+
+for name, weight in bridge.export_hf_weights(megatron_model, cpu=True):
+    print(f"Exported {name}: {tuple(weight.shape)}")
+```
+
+## Common Patterns and Best Practices
+When working with Megatron Bridge, there are several patterns that will help you use the API effectively and avoid common pitfalls.
+
+### 1. Always Use High-Level APIs
+Always prefer high-level APIs like `AutoBridge` for automatic model detection. Avoid direct bridge usage unless you know the specific type required:
+
+```python
+# ✅ Preferred: Use AutoBridge for automatic detection
+bridge = AutoBridge.from_hf_pretrained("any-supported-model")
+
+# ❌ Avoid: Direct bridge usage unless you know the specific type
+```
+
+### 2. Configure Before Creating Models
+When using the provider pattern, always configure parallelism and other settings before creating the model. Creating the model first uses default settings that may not be optimal:
+
+```python
+# ✅ Correct: Configure provider before creating model
+provider = bridge.to_megatron_provider()
+provider.tensor_model_parallel_size = 8
+provider.finalize()
+model = provider.provide_distributed_model(wrap_with_ddp=False)
+
+# ❌ Avoid: Creating model before configuring parallelism
+model = bridge.to_megatron_model()  # Uses default settings
+```
+
+### 3. Leverage the Parameter Streaming API
+You can stream converted weights from Megatron to HF without saving to disk:
+
+```python
+# ✅ Use streaming for large models
+for name, weight in bridge.export_hf_weights(model, cpu=True):
+    process_weight(name, weight)
+```
+
+### 4. Preserve Artifacts in Export Workflows
+
+Use `from_hf_pretrained()` when an existing Hugging Face repository or local
+directory provides the configuration, tokenizer, and other export artifacts.
+The pretrained wrapper loads these artifacts lazily; exporting Megatron weights
+does not require materializing the reference Hugging Face model weights.
+
+```python
+from megatron.bridge import AutoBridge
+
+bridge = AutoBridge.from_hf_pretrained("meta-llama/Llama-3.2-1B")
+bridge.export_ckpt("./megatron_checkpoints/llama32_1b", "./hf_exports/llama32_1b")
+```
+
+#### Config-only export without reference weights
+
+For a supported model architecture, `from_hf_config()` can also export a matching
+Megatron checkpoint. You do not need to create an initial Hugging Face weight
+checkpoint to train from scratch: use `load_weights=False` when constructing the
+Megatron model, as described above.
+
+A config-only bridge does not retain a tokenizer. To include one in the export,
+provide an artifact-only directory via `source_path`. For a standard Llama model,
+this directory contains a matching `config.json` and the tokenizer files saved
+with `tokenizer.save_pretrained()`, but needs no Hugging Face weight files:
+
+```python
+from transformers import AutoConfig
+
+from megatron.bridge import AutoBridge
+
+# ./hf_artifacts contains the model config and tokenizer, not reference weights.
+config = AutoConfig.from_pretrained("./hf_artifacts", local_files_only=True)
+bridge = AutoBridge.from_hf_config(config)
+bridge.export_ckpt(
+    "./megatron_checkpoints/my_model",
+    "./hf_exports/my_model",
+    source_path="./hf_artifacts",
+)
+```
+
+The configuration must identify a supported architecture (for example,
+`architectures=["LlamaForCausalLM"]`) and match the checkpoint. Model families may
+also require processor artifacts, additional files, or trusted custom modeling
+code; those must be supplied separately. Not every bridge supports standalone
+Hugging Face checkpoint export.
+
+Without an artifact source, config-only export writes `config.json` and the
+converted weights, but does not produce tokenizer files. Save your tokenizer to
+the output directory separately if consumers need it. This describes current
+Bridge behavior; older containers that fail with
+`AttributeError: 'LlamaConfig' object has no attribute 'save_artifacts'` need a
+Bridge version with config-only export support.
+
+For more examples and advanced usage patterns, see the `examples/conversion/` directory in the repository.
+
+## Convenience Workflows (Commands)
+
+These examples can be run directly as shell commands.
+
+### HF → Megatron checkpoint import (one call)
+
+```bash
+huggingface-cli login --token <your token>
+uv run python -c "from megatron.bridge import AutoBridge; AutoBridge.import_ckpt('meta-llama/Llama-3.2-1B','./megatron_checkpoints/llama32_1b')"
+```
+
+Or with a helper script:
+
+```bash
+huggingface-cli login --token <your token>
+./scripts/conversion/convert.sh import --hf-model meta-llama/Llama-3.2-1B --megatron-path ./megatron_checkpoints/llama32_1b
+```
+
+### Megatron → HF export (one call)
+
+```bash
+uv run python -c "from megatron.bridge import AutoBridge; b=AutoBridge.from_hf_pretrained('meta-llama/Llama-3.2-1B'); b.export_ckpt('./megatron_checkpoints/llama32_1b','./hf_exports/llama32_1b')"
+```
+
+Or with a helper script:
+
+```bash
+./scripts/conversion/convert.sh export --hf-model meta-llama/Llama-3.2-1B --megatron-path ./megatron_checkpoints/llama32_1b --hf-path ./hf_exports/llama32_1b
+```
+
+Megatron-LM training checkpoints do not normally contain the Bridge
+`run_config.yaml` required by this export command. See
+[Best-effort export of an existing Megatron-LM checkpoint](megatron-lm-to-megatron-bridge.md#best-effort-export-of-an-existing-megatron-lm-checkpoint)
+for the configuration generation and validation workflow.
+
+### Create Megatron models and run locally
+
+```bash
+uv run python - << 'PY'
+from megatron.bridge import AutoBridge
+
+bridge = AutoBridge.from_hf_pretrained('meta-llama/Llama-3.2-1B')
+provider = bridge.to_megatron_provider()
+provider.tensor_model_parallel_size = 1
+provider.pipeline_model_parallel_size = 1
+provider.finalize()
+model = provider.provide_distributed_model(wrap_with_ddp=False)
+
+# Export to HF folder
+bridge.save_hf_pretrained(model, './hf_exports/llama32_1b')
+PY
+```
+
+### Launch with multiple GPUs (example)
+
+```bash
+uv run python -m torch.distributed.run --nproc-per-node=2 -m examples.conversion.generate_from_hf
+```
+
+## AutoBridge API Reference
+
+Latest public APIs and signatures (see {doc}`apidocs/bridge/bridge.models.conversion.auto_bridge`):
+
+```python
+from megatron.bridge import AutoBridge
+
+# Creation and capability
+AutoBridge.from_hf_pretrained(path: str | Path, **kwargs) -> AutoBridge
+AutoBridge.from_hf_config(config: PretrainedConfig) -> AutoBridge
+AutoBridge.can_handle(path: str | Path, trust_remote_code: bool = False) -> bool
+AutoBridge.list_supported_models() -> list[str]
+AutoBridge.supports(config: Any) -> bool
+
+# Provider/model construction
+# Builder-backed APIs are available only for model families migrated during the incremental rollout.
+AutoBridge.get_model_config() -> ModelConfig
+AutoBridge.get_model(model_config: ModelConfig | None = None, *, load_weights: bool = True, hf_path: str | Path | None = None, pg_collection: ProcessGroupCollection | None = None, **kwargs) -> list[MegatronModule]
+AutoBridge.to_megatron_provider(load_weights: bool = True, hf_path: str | Path | None = None) -> GPTModelProvider
+AutoBridge.to_megatron_model(load_weights: bool = True, hf_path: str | Path | None = None, **kwargs) -> list[MegatronModule]
+
+# HF → Megatron weights
+AutoBridge.load_hf_weights(model: list[MegatronModule], hf_path: str | Path | None = None) -> None
+
+# Megatron → HF conversion
+AutoBridge.export_hf_weights(model: list[MegatronModule], cpu: bool = False, show_progress: bool = True, conversion_tasks: Optional[list[WeightConversionTask]] = None, current_pp_stage_only: bool = False) -> Iterable[HFWeightTuple]
+AutoBridge.save_hf_pretrained(model: list[MegatronModule], path: str | Path, show_progress: bool = True) -> None
+AutoBridge.save_hf_weights(model: list[MegatronModule], path: str | Path, show_progress: bool = True) -> None
+
+# Megatron native checkpoints
+AutoBridge.save_megatron_model(model: list[MegatronModule], path: str | Path) -> None
+AutoBridge.load_megatron_model(path: str | Path, **kwargs) -> list[MegatronModule]
+
+# One-call workflows
+AutoBridge.import_ckpt(hf_model_id: str | Path, megatron_path: str | Path, **kwargs) -> None  # HF → Megatron ckpt
+AutoBridge.export_ckpt(megatron_path: str | Path, hf_path: str | Path, show_progress: bool = True) -> None  # Megatron → HF
+
+# Config extraction
+AutoBridge.transformer_config -> TransformerConfig
+AutoBridge.mla_transformer_config -> MLATransformerConfig
+
+# Introspection / planning
+AutoBridge.get_conversion_tasks(megatron_model: MegatronModule | list[MegatronModule], hf_path: str | Path | None = None) -> list[WeightConversionTask]
+```

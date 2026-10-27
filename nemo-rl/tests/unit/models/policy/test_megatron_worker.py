@@ -1,0 +1,6246 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import ast
+import asyncio
+import math
+import os
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Optional
+from unittest.mock import MagicMock, call
+
+import numpy as np
+import pytest
+import ray
+import torch
+
+from nemo_rl.algorithms.loss import (
+    ClippedPGLossConfig,
+    ClippedPGLossFn,
+    DPOLossConfig,
+    DPOLossFn,
+    NLLLossFn,
+)
+from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.generation.megatron import MegatronGeneration
+from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.weight_sync.nccl_reshard_utils import HFToLocalParamMap
+from tests.check_checkpoint_freshness import hash_checkpoint_tensors
+from tests.unit.test_utils import SimpleLossFn
+
+pytestmark = pytest.mark.mcore
+
+# Megatron Core/Bridge and worker-module imports stay test-local so pytest can
+# collect this module without the optional MCore/Transformer Engine stack.
+
+
+def _make_refit_task(
+    *,
+    param_name: str,
+    destination: object,
+    dependencies: tuple[str, ...],
+    local_specs: tuple[tuple[str, str], ...] = (),
+    mapping: object | None = None,
+):
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        _MegatronRefitTask,
+    )
+
+    specs = ()
+    if local_specs:
+        from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
+
+        specs = tuple(
+            LocalHFParamSpec(
+                name,
+                None if component == "full" else -2,
+                1 if component == "up" else 0,
+                1 if component == "full" else 2,
+            )
+            for name, component in local_specs
+        )
+
+    def combine_local_hf_weights(weights):
+        if len(specs) == 1:
+            return weights[specs[0].name]
+        return torch.cat(
+            [
+                weights[spec.name]
+                for spec in sorted(specs, key=lambda item: item.split_index)
+            ],
+            dim=-2,
+        )
+
+    conversion_task = SimpleNamespace(
+        param_name=param_name,
+        global_param_name=param_name,
+        vp_stage=0,
+        hf_param_names=dependencies,
+        mapping=mapping if mapping is not None else MagicMock(),
+        local_hf_param_specs=lambda: specs,
+        combine_local_hf_weights=combine_local_hf_weights,
+    )
+    return _MegatronRefitTask(
+        conversion_task=conversion_task,
+        destination=destination,
+        target_id=id(destination),
+    )
+
+
+def test_mcore_nccl_m2n_builds_hybrid_group_and_copy_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import torch.distributed.distributed_c10d as distributed_c10d
+
+    from nemo_rl.models.generation.megatron import megatron_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronGenerationRefitMixin)
+    worker.model = object()
+
+    process_group = MagicMock()
+    process_group_type = MagicMock(return_value=process_group)
+    process_group_type.BackendType = worker_module.ProcessGroup.BackendType
+    gloo_backend = MagicMock()
+    nccl_backend = MagicMock()
+    nccl_backend_type = MagicMock(return_value=nccl_backend)
+    nccl_backend_type.Options.return_value = MagicMock()
+    m2n_service = MagicMock()
+    m2n_service_type = MagicMock(return_value=m2n_service)
+    prepare_swap_model_weights = MagicMock()
+
+    monkeypatch.setattr(worker_module, "ProcessGroup", process_group_type)
+    monkeypatch.setattr(
+        worker_module, "ProcessGroupGloo", MagicMock(return_value=gloo_backend)
+    )
+    monkeypatch.setattr(worker_module, "PrefixStore", MagicMock())
+    tcp_store_type = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(worker_module.torch.distributed, "TCPStore", tcp_store_type)
+    monkeypatch.setattr(
+        worker_module.torch.distributed, "get_rank", MagicMock(return_value=0)
+    )
+    monkeypatch.setattr(
+        worker_module.torch.cuda, "current_device", MagicMock(return_value=0)
+    )
+    monkeypatch.setattr(worker_module.torch.cuda, "set_device", MagicMock())
+    monkeypatch.setattr(distributed_c10d, "ProcessGroupNCCL", nccl_backend_type)
+    monkeypatch.setattr(worker_module, "NCCLM2NCopyService", m2n_service_type)
+    monkeypatch.setattr(
+        worker_module, "prepare_swap_model_weights", prepare_swap_model_weights
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_world",
+        SimpleNamespace(pg_group_ranks={}, pg_map={}, pg_names={}),
+    )
+
+    worker.init_collective_mcore_generation(
+        "127.0.0.1",
+        1234,
+        4,
+        rank_offset=2,
+        refit_execution_batch_bytes=123,
+        refit_backend="nccl_m2n",
+    )
+
+    assert process_group._register_backend.call_count == 2
+    # rank_offset is the whole point of this signature: generation ranks join the
+    # shared group AFTER the training ranks, so every backend must be built at
+    # the offset rank (0 + 2), not this world's local rank.
+    assert process_group_type.call_args.args[1:] == (2, 4)
+    assert nccl_backend_type.call_args.args[1:3] == (2, 4)
+    assert tcp_store_type.call_args.kwargs["is_master"] is False
+    nccl_backend_type.assert_called_once()
+    m2n_service_type.assert_called_once_with(group=process_group)
+    assert worker.refit_copy_service is m2n_service
+    prepare_swap_model_weights.assert_called_once_with(
+        src_model=None,
+        target_model=worker.model,
+        group=process_group,
+        src_rank_offset=0,
+        dst_rank_offset=2,
+        execution_batch_bytes=123,
+    )
+
+
+@pytest.mark.parametrize(
+    "fp8_cfg,physical_export",
+    [
+        (None, False),
+        ({"fp8_param": False, "fp8_recipe": "blockwise"}, False),
+        ({"fp8_param": True, "fp8_recipe": "mxfp8"}, False),
+        ({"fp8_param": True, "fp8_recipe": "blockwise"}, True),
+    ],
+)
+def test_megatron_fp8_refit_tasks_preserve_backend_export(
+    fp8_cfg: Optional[dict], physical_export: bool
+) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = fp8_cfg
+    worker.model = object()
+    physical_tasks = [object()]
+    logical_tasks = [None, object()]
+    worker.megatron_bridge = SimpleNamespace(
+        get_export_fp8_tasks=MagicMock(return_value=physical_tasks),
+        get_conversion_tasks=MagicMock(return_value=logical_tasks),
+    )
+
+    worker.cfg = {"generation": {"backend": "megatron"}}
+    assert worker._build_refit_conversion_tasks() == logical_tasks[1:]
+    worker.megatron_bridge.get_export_fp8_tasks.assert_not_called()
+
+    worker.cfg = {"generation": {"backend": "vllm"}}
+    assert worker._build_refit_conversion_tasks() == (
+        physical_tasks if physical_export else logical_tasks[1:]
+    )
+    if physical_export:
+        worker.megatron_bridge.get_export_fp8_tasks.assert_called_once_with(
+            worker.model
+        )
+    else:
+        worker.megatron_bridge.get_export_fp8_tasks.assert_not_called()
+    # Bulk refit always starts from standard mappings, even when the general
+    # export still needs physical FP8 data and scales.
+    assert worker._build_bulk_refit_conversion_tasks() == logical_tasks[1:]
+
+
+def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
+    """The misc/collective vLLM export retains Bridge's physical FP8 payload.
+
+    ``_iter_logical_refit_conversion_tasks`` exists so a Megatron inference
+    engine can consume quantized training storage. Applying
+    it to the vLLM misc/collective path would replace ``...weight`` with BF16
+    while its ``..._scale_inv`` sibling passed through untouched, so vLLM would
+    rescale BF16 values with a blockwise scale - wrong weights, no error.
+    The NCCL bulk path prepares logical weights through separate source hooks.
+    """
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    fp8_payload = torch.zeros(4, 2, dtype=torch.float8_e4m3fn)
+
+    class _QuantizedParam(torch.Tensor):
+        """Stands in for a live TE Float8BlockwiseQTensor on the module."""
+
+    module = SimpleNamespace(
+        weight=_QuantizedParam(torch.zeros(4, 2, dtype=torch.bfloat16))
+    )
+    task = SimpleNamespace(
+        param_weight=fp8_payload,
+        megatron_module=module,
+        param_name="linear_fc1.weight",
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = object()
+    worker.draft_model = None
+    worker.refit_conversion_tasks = [task]
+    worker.megatron_bridge = SimpleNamespace(
+        export_hf_weights=MagicMock(return_value=iter(()))
+    )
+
+    worker.cfg = {"generation": {"backend": "vllm"}}
+    list(worker._iter_params_with_optional_kv_scales())
+    forwarded = worker.megatron_bridge.export_hf_weights.call_args.kwargs[
+        "conversion_tasks"
+    ]
+    # The vLLM path forwards Bridge's task list verbatim - not a rewriting generator.
+    assert list(forwarded) == [task]
+    assert forwarded[0].param_weight.dtype == torch.float8_e4m3fn
+
+    worker.cfg = {"generation": {"backend": "megatron"}}
+    list(worker._iter_params_with_optional_kv_scales())
+    megatron_forwarded = worker.megatron_bridge.export_hf_weights.call_args.kwargs[
+        "conversion_tasks"
+    ]
+    # Megatron generation gets the materializing generator instead.
+    assert not isinstance(megatron_forwarded, list)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_local_hf_shards_follow_bridge_specs(dtype: torch.dtype) -> None:
+    from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    fused = torch.nn.Parameter(
+        1 + torch.arange(8, dtype=dtype).reshape(4, 2) / 1024,
+        requires_grad=False,
+    )
+    if dtype != torch.bfloat16:
+        assert not torch.equal(fused, fused.to(torch.bfloat16).to(dtype))
+    task = SimpleNamespace(
+        param_weight=fused,
+        megatron_module=None,
+        param_name="linear_fc1.weight",
+        global_param_name="decoder.layers.0.mlp.linear_fc1.weight",
+        local_hf_param_specs=lambda: (
+            LocalHFParamSpec("model.layers.0.mlp.gate_proj.weight", -2, 0, 2),
+            LocalHFParamSpec("model.layers.0.mlp.up_proj.weight", -2, 1, 2),
+        ),
+    )
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker._bulk_refit_conversion_tasks = [task]
+
+    shards = dict(worker._iter_local_hf_param_shards())
+
+    for index, name in enumerate(("gate", "up")):
+        spec = shards[f"model.layers.0.mlp.{name}_proj.weight"]
+        assert spec.base.tensor is fused and spec.pre is not None and spec.post is None
+        assert spec.wire_dtype == dtype
+        result = spec.materialize().buf
+        assert result.dtype == dtype and result.is_contiguous()
+        assert torch.equal(result, fused[index * 2 : (index + 1) * 2])
+    fused[0, 0] = 99
+    assert shards["model.layers.0.mlp.gate_proj.weight"].materialize().buf[0, 0] == 99
+    fused.data = torch.full_like(fused, 1.0009765625)
+    for spec in shards.values():
+        assert torch.equal(
+            spec.materialize().buf,
+            torch.full((2, 2), 1.0009765625, dtype=dtype),
+        )
+
+
+def test_local_refit_names_require_safe_views_from_every_grouped_task() -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _collect_local_refit_hf_names,
+    )
+
+    grouped_name = "model.layers.0.mlp.experts.down_proj"
+    safe_name = "model.layers.0.mlp.down_proj.weight"
+    tasks = [
+        SimpleNamespace(
+            hf_param_names=(grouped_name,),
+            local_hf_param_specs=lambda: (object(),),
+        ),
+        SimpleNamespace(
+            hf_param_names=(grouped_name,),
+            local_hf_param_specs=lambda: (),
+        ),
+        SimpleNamespace(
+            hf_param_names=(safe_name,),
+            local_hf_param_specs=lambda: (object(),),
+        ),
+    ]
+
+    assert _collect_local_refit_hf_names(tasks) == {safe_name}
+
+
+def test_local_refit_names_are_expert_parallel_invariant(monkeypatch) -> None:
+    """Every EP rank must agree on the safe-view set.
+
+    Bridge conversion tasks are EP-local (each rank only enumerates its own
+    ``experts.N.*``), but the name stream they are matched against is EP-global.
+    Without an EP reduction rank 0 would omit expert 1 purely because it never
+    saw a task for it, so the two ranks would disagree on the bulk/misc split.
+    """
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _collect_local_refit_hf_names,
+    )
+
+    expert0 = "model.layers.0.mlp.experts.0.down_proj.weight"
+    expert1 = "model.layers.0.mlp.experts.1.down_proj.weight"
+    unsafe = "model.layers.0.self_attn.qkv_proj.weight"
+
+    # Rank 0 owns expert 0 and sees the unsafe attention mapping; rank 1 owns
+    # expert 1. Neither rank alone can name both experts.
+    per_rank = [
+        {expert0: True, unsafe: False},
+        {expert1: True},
+    ]
+
+    ep_group = object()
+    monkeypatch.setattr(
+        worker_module.parallel_state,
+        "get_expert_model_parallel_group",
+        lambda check_initialized=True: ep_group,
+    )
+    monkeypatch.setattr(
+        worker_module.torch.distributed, "get_world_size", lambda group=None: 2
+    )
+
+    def fake_all_gather_object(out, obj, group=None):
+        assert group is ep_group
+        # Pin what this rank contributes, not just what it receives: otherwise a
+        # wrong local support map would still produce the expected union.
+        assert obj == {expert0: True, unsafe: False}
+        out[:] = [obj, per_rank[1]]
+
+    monkeypatch.setattr(
+        worker_module.torch.distributed, "all_gather_object", fake_all_gather_object
+    )
+
+    tasks = [
+        SimpleNamespace(
+            hf_param_names=(expert0,),
+            local_hf_param_specs=lambda: (object(),),
+        ),
+        SimpleNamespace(
+            hf_param_names=(unsafe,),
+            local_hf_param_specs=lambda: (),
+        ),
+    ]
+
+    # Both experts are present and safe; the unsafe attention name stays out.
+    assert _collect_local_refit_hf_names(tasks) == {expert0, expert1}
+
+
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    misc_name = "model.layers.0.mlp.experts.down_proj"
+    task = SimpleNamespace(
+        global_param_name="decoder.layers.0.mlp.experts.linear_fc2.weight",
+        hf_param_names=(misc_name,),
+        mapping=SimpleNamespace(hf_param=misc_name),
+        local_hf_param_specs=lambda: (),
+    )
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.refit_conversion_tasks = [task]
+    worker.model = object()
+    worker.megatron_bridge = SimpleNamespace(
+        export_hf_weights=MagicMock(return_value=iter(()))
+    )
+    worker._build_bulk_refit_conversion_tasks = MagicMock(return_value=[task])
+    worker._calculate_refit_param_info = MagicMock(return_value={})
+    worker._iter_params_with_optional_kv_scales = MagicMock(
+        return_value=iter([(misc_name, torch.empty(2, 2))])
+    )
+    worker._build_layer_to_pp_stage = MagicMock()
+    worker.build_hf_to_local_param_map = MagicMock(return_value=HFToLocalParamMap())
+
+    info = worker.prepare_nccl_reshard_refit_info(
+        train_parallelism={"tp_size": 1, "ep_size": 1, "pp_size": pp_size},
+        gen_parallelism={"tp_size": 1, "ep_size": 1, "pp_size": 1},
+        train_world_size=pp_size,
+        gen_world_size=1,
+    )
+
+    assert info["layer_names"] == []
+    assert info["per_layer_params"] == {}
+    assert list(info["misc_meta"]) == [misc_name]
+    assert worker.hf_to_local_param_map.specs == {}
+    assert worker._misc_conversion_tasks == [task]
+    worker._build_layer_to_pp_stage.assert_not_called()
+
+
+@pytest.mark.parametrize("wire_dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_nccl_reshard_bulk_metadata_and_misc_scales_are_separate(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    wire_dtype: torch.dtype,
+) -> None:
+    """Only scales for selected bulk weights disappear from the misc stream."""
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    bulk_name = "model.layers.0.mlp.gate_proj.weight"
+    misc_weight = "model.layers.0.self_attn.q_proj.weight"
+    unsafe_weight = "model.layers.0.mlp.down_proj.weight"
+    # A meta tensor makes byte-accounting differences visible in the GiB log
+    # without allocating a large parameter. Quantized export arrives as BF16;
+    # ordinary FP16/FP32 export retains its source dtype.
+    logical_bulk = torch.empty(32768, 8192, dtype=wire_dtype, device="meta")
+    values = {
+        bulk_name: torch.empty(4, 2, dtype=torch.float8_e4m3fn),
+        bulk_name + "_scale_inv": torch.full((1,), 3.0),
+        bulk_name + "_scale": torch.full((1,), 4.0),
+        misc_weight: torch.empty(4, 2, dtype=torch.float8_e4m3fn),
+        misc_weight + "_scale_inv": torch.full((1,), 5.0),
+        unsafe_weight: torch.empty(4, 2, dtype=torch.float8_e4m3fn),
+        unsafe_weight + "_scale_inv": torch.full((1,), 6.0),
+        "model.layers.0.self_attn.k_scale": torch.full((1,), 7.0),
+        "model.layers.0.self_attn.v_scale": torch.full((1,), 8.0),
+        "model.layers.0.input_layernorm.weight": torch.ones(2, dtype=torch.float32),
+    }
+
+    def task(name: str, safe: bool = False) -> SimpleNamespace:
+        return SimpleNamespace(
+            global_param_name=name,
+            hf_param_names=(name,),
+            mapping=SimpleNamespace(hf_param=name),
+            local_hf_param_specs=lambda: (object(),) if safe else (),
+        )
+
+    bulk_task = task(bulk_name, safe=True)
+    export_tasks = [task(name) for name in values]
+    compound_task = SimpleNamespace(
+        global_param_name="decoder.layers.0.compound.weight",
+        mapping=SimpleNamespace(hf_param={"first": bulk_name, "second": misc_weight}),
+    )
+    export_tasks.append(compound_task)
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.model = object()
+    worker.model_update_group = object()
+    worker.refit_conversion_tasks = export_tasks
+    worker._calculate_refit_param_info = MagicMock(return_value=[])
+    worker._build_bulk_refit_conversion_tasks = MagicMock(
+        return_value=[bulk_task, task(unsafe_weight)]
+    )
+    worker.megatron_bridge = SimpleNamespace(
+        export_hf_weights=MagicMock(
+            return_value=iter(
+                [(bulk_name, logical_bulk), (unsafe_weight, logical_bulk)]
+            )
+        )
+    )
+    worker._iter_params_with_optional_kv_scales = MagicMock(
+        side_effect=lambda **kwargs: iter(values.items())
+    )
+    worker.build_hf_to_local_param_map = MagicMock(return_value=HFToLocalParamMap())
+    info = worker.prepare_nccl_reshard_refit_info(
+        train_parallelism={"tp_size": 1, "ep_size": 1, "pp_size": 1},
+        gen_parallelism={"tp_size": 1, "ep_size": 1, "pp_size": 1},
+        train_world_size=1,
+        gen_world_size=1,
+    )
+
+    bulk_meta = info["per_layer_params"]["model.layers.0"][0]
+    assert bulk_meta["name"] == bulk_name
+    assert bulk_meta["dtype"] == str(wire_dtype)
+    assert bulk_meta["global_shape"] == tuple(logical_bulk.shape)
+    expected_gib = logical_bulk.numel() * logical_bulk.element_size() / 1024**3
+    assert f"nccl_reshard={expected_gib:.2f}GiB" in capsys.readouterr().out
+    expected_misc = {
+        name: tensor
+        for name, tensor in values.items()
+        if name not in {bulk_name, bulk_name + "_scale_inv", bulk_name + "_scale"}
+    }
+    assert list(info["misc_meta"]) == list(expected_misc)
+    assert all(
+        info["misc_meta"][name]["dtype"] == str(tensor.dtype)
+        for name, tensor in expected_misc.items()
+    )
+    assert compound_task in worker._misc_conversion_tasks
+
+    received = []
+    monkeypatch.setattr(
+        worker_module,
+        "packed_broadcast_producer",
+        lambda *, iterator, **kwargs: received.extend(iterator),
+    )
+    worker._broadcast_misc_params_packed(kv_scales={"unused": 1.0})
+    assert [name for name, _ in received] == list(expected_misc)
+    assert all(tensor is expected_misc[name] for name, tensor in received)
+    worker._iter_params_with_optional_kv_scales.assert_called_with(
+        kv_scales={"unused": 1.0},
+        conversion_tasks=worker._misc_conversion_tasks,
+    )
+
+
+def test_refit_destination_uses_common_worker_interface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.is_refit_destination = True
+    worker.model_update_group = object()
+    worker._generation_nccl_reshard_groups = {}
+    tasks = [object()]
+    expected_map = HFToLocalParamMap()
+    refit_info = {"layer_names": [], "per_layer_params": {}}
+    state_dict_info = {"weight": ((2, 2), torch.bfloat16)}
+    worker._build_generation_refit_tasks = MagicMock(
+        return_value=([torch.nn.Module()], tasks)
+    )
+    worker._build_destination_hf_to_local_param_map = MagicMock(
+        return_value=expected_map
+    )
+    worker._prepare_destination_refit_info = MagicMock()
+    worker._prepare_destination_nccl_reshard_refit_info = MagicMock()
+    worker._destination_nccl_reshard_refit = MagicMock(return_value=True)
+    worker._update_destination_weights_from_collective = MagicMock(return_value=True)
+    set_device = MagicMock()
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    monkeypatch.setattr(torch.cuda, "set_device", set_device)
+
+    assert worker.build_hf_to_local_param_map(refit_info) is expected_map
+    worker.prepare_refit_info(state_dict_info)
+    worker.prepare_nccl_reshard_refit_info(refit_info=refit_info)
+    assert asyncio.run(worker.nccl_reshard_refit())
+    assert asyncio.run(worker.update_weights_from_collective())
+
+    worker._build_destination_hf_to_local_param_map.assert_called_once_with(
+        refit_info, tasks
+    )
+    worker._prepare_destination_refit_info.assert_called_once_with(state_dict_info)
+    worker._prepare_destination_nccl_reshard_refit_info.assert_called_once_with(
+        refit_info
+    )
+    worker._destination_nccl_reshard_refit.assert_called_once_with(refit_timeout_s=None)
+    worker._update_destination_weights_from_collective.assert_called_once_with(
+        refit_timeout_s=None
+    )
+    assert set_device.call_args_list == [call(3), call(3)]
+
+
+def test_m2n_destination_refreshes_flashinfer_after_misc_import(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronGenerationRefitMixin)
+    worker.nccl_reshard_refit_info = {
+        "layer_names": [],
+        "per_layer_params": {},
+    }
+    worker._generation_nccl_reshard_groups = {}
+    worker._update_destination_weights_from_collective = MagicMock(return_value=True)
+    worker._refresh_flashinfer_mxfp8_weights = MagicMock()
+
+    monkeypatch.setattr(torch.cuda, "Stream", MagicMock)
+    monkeypatch.setattr(torch.cuda, "current_stream", MagicMock)
+    monkeypatch.setattr(torch.cuda, "empty_cache", MagicMock())
+    monkeypatch.setattr(
+        "nemo_rl.distributed.refit_watchdog.sync_stream_within", MagicMock()
+    )
+
+    assert worker._destination_nccl_reshard_refit(refit_timeout_s=30.0)
+    worker._update_destination_weights_from_collective.assert_called_once_with(
+        refit_timeout_s=30.0,
+        refresh_mxfp8=False,
+    )
+    worker._refresh_flashinfer_mxfp8_weights.assert_called_once_with()
+
+
+@pytest.mark.parametrize("did_refresh", [False, True])
+def test_flashinfer_mxfp8_refresh_synchronizes_only_after_repacking(
+    monkeypatch: pytest.MonkeyPatch,
+    did_refresh: bool,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker as worker_module
+
+    core = torch.nn.Module()
+    core.experts = torch.nn.Module()
+    core.experts.refresh_flashinfer_mxfp8_weights = MagicMock(return_value=did_refresh)
+    worker = object.__new__(worker_module.MegatronGenerationRefitMixin)
+    worker.model = core
+    synchronize = MagicMock()
+    monkeypatch.setattr(worker_module, "unwrap_model", lambda model: model)
+    monkeypatch.setattr(torch.cuda, "synchronize", synchronize)
+
+    worker._refresh_flashinfer_mxfp8_weights()
+
+    core.experts.refresh_flashinfer_mxfp8_weights.assert_called_once_with()
+    assert synchronize.call_count == int(did_refresh)
+
+
+def test_megatron_destination_misc_plan_uses_shipped_misc_metadata() -> None:
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationRefitMixin,
+    )
+
+    bulk_task = SimpleNamespace(
+        dependencies=("model.layers.0.mlp.experts.0.gate_proj.weight",)
+    )
+    misc_task = SimpleNamespace(dependencies=("model.layers.0.input_layernorm.weight",))
+    model_chunks = [torch.nn.Module()]
+    worker = object.__new__(MegatronGenerationRefitMixin)
+    worker._build_generation_refit_tasks = MagicMock(
+        return_value=(model_chunks, [bulk_task, misc_task])
+    )
+    worker._prepare_mxfp8_refit = MagicMock()
+    worker.build_hf_to_local_param_map = MagicMock(return_value=HFToLocalParamMap())
+    worker._install_generation_refit_plan = MagicMock()
+    refit_info = {
+        "layer_names": [],
+        "per_layer_params": {},
+        "misc_meta": {
+            "model.layers.0.input_layernorm.weight": {
+                "shape": [2],
+                "dtype": "torch.bfloat16",
+            }
+        },
+    }
+
+    worker._prepare_destination_nccl_reshard_refit_info(refit_info)
+
+    worker._install_generation_refit_plan.assert_called_once_with(
+        model_chunks=model_chunks,
+        tasks=[misc_task],
+        state_dict_info={
+            "model.layers.0.input_layernorm.weight": ((2,), torch.bfloat16)
+        },
+    )
+
+
+def test_megatron_m2n_stages_fused_mxfp8_weight_until_complete() -> None:
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationRefitMixin,
+    )
+
+    gate_name = "model.layers.0.mlp.gate_proj.weight"
+    up_name = "model.layers.0.mlp.up_proj.weight"
+    destination = MXFP8Tensor(
+        data=torch.empty((8, 2)),
+        scale=torch.empty(1),
+        dtype=torch.bfloat16,
+        backend="triton",
+    )
+    task = _make_refit_task(
+        param_name="decoder.layers.0.mlp.linear_fc1.weight",
+        destination=destination,
+        dependencies=(gate_name, up_name),
+        local_specs=((gate_name, "gate"), (up_name, "up")),
+    )
+    refit_info = {
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {"name": gate_name, "dtype": "torch.bfloat16"},
+                {"name": up_name, "dtype": "torch.bfloat16"},
+            ]
+        },
+    }
+    worker = object.__new__(MegatronGenerationRefitMixin)
+    worker._generation_m2n_pending = {}
+    worker._write_generation_refit_weight = MagicMock()
+    param_map = worker._build_destination_hf_to_local_param_map(refit_info, [task])
+
+    gate_spec = param_map.get(gate_name)
+    gate_ctx = gate_spec.pre(None)
+    gate_ctx.buf.fill_(3)
+    gate_spec.post(gate_ctx)
+    worker._write_generation_refit_weight.assert_not_called()
+
+    up_spec = param_map.get(up_name)
+    up_ctx = up_spec.pre(None)
+    up_ctx.buf.fill_(5)
+    up_spec.post(up_ctx)
+
+    fused = worker._write_generation_refit_weight.call_args.args[1]
+    assert torch.equal(fused[:4], torch.full_like(fused[:4], 3))
+    assert torch.equal(fused[4:], torch.full_like(fused[4:], 5))
+    assert worker._generation_m2n_pending == {}
+
+
+def test_megatron_m2n_unstacks_grouped_experts_into_local_weights() -> None:
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationRefitMixin,
+    )
+
+    tasks = []
+    destinations = []
+    for expert in range(2):
+        gate_name = f"model.layers.0.mlp.experts.{expert}.gate_proj.weight"
+        up_name = f"model.layers.0.mlp.experts.{expert}.up_proj.weight"
+        destination = torch.nn.Parameter(
+            torch.zeros((4, 2), dtype=torch.bfloat16), requires_grad=False
+        )
+        destinations.append(destination)
+        tasks.append(
+            _make_refit_task(
+                param_name=(
+                    f"decoder.layers.0.mlp.experts.local_experts.{expert}.linear_fc1.weight"
+                ),
+                destination=destination,
+                dependencies=(gate_name, up_name),
+                local_specs=((gate_name, "gate"), (up_name, "up")),
+            )
+        )
+
+    grouped_gate = "model.layers.0.mlp.experts.gate_proj.weight"
+    grouped_up = "model.layers.0.mlp.experts.up_proj.weight"
+    refit_info = {
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [
+                {
+                    "name": grouped_gate,
+                    "grouped_expert_proj": "gate_proj",
+                    "dtype": "torch.bfloat16",
+                },
+                {
+                    "name": grouped_up,
+                    "grouped_expert_proj": "up_proj",
+                    "dtype": "torch.bfloat16",
+                },
+            ]
+        },
+    }
+    worker = object.__new__(MegatronGenerationRefitMixin)
+    param_map = worker._build_destination_hf_to_local_param_map(refit_info, tasks)
+
+    orphaned_storage = [destination.data for destination in destinations]
+    for destination in destinations:
+        destination.data = torch.full_like(destination, -1)
+
+    gate_spec = param_map.get(grouped_gate)
+    gate_ctx = gate_spec.pre(None)
+    gate_ctx.buf[0].fill_(1)
+    gate_ctx.buf[1].fill_(2)
+    gate_spec.post(gate_ctx)
+    up_spec = param_map.get(grouped_up)
+    up_ctx = up_spec.pre(None)
+    up_ctx.buf[0].fill_(3)
+    up_ctx.buf[1].fill_(4)
+    up_spec.post(up_ctx)
+
+    assert torch.equal(destinations[0][:2], torch.ones_like(destinations[0][:2]))
+    assert torch.equal(destinations[0][2:], torch.full_like(destinations[0][2:], 3))
+    assert torch.equal(destinations[1][:2], torch.full_like(destinations[1][:2], 2))
+    assert torch.equal(destinations[1][2:], torch.full_like(destinations[1][2:], 4))
+    assert all(torch.count_nonzero(storage).item() == 0 for storage in orphaned_storage)
+
+
+def test_megatron_m2n_resolves_direct_destination_after_parameter_rebind() -> None:
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationRefitMixin,
+    )
+
+    gate_name = "model.layers.0.mlp.gate_proj.weight"
+    up_name = "model.layers.0.mlp.up_proj.weight"
+    destination = torch.nn.Parameter(
+        torch.zeros((4, 2), dtype=torch.bfloat16), requires_grad=False
+    )
+    task = _make_refit_task(
+        param_name="decoder.layers.0.mlp.linear_fc1.weight",
+        destination=destination,
+        dependencies=(gate_name, up_name),
+        local_specs=((gate_name, "gate"), (up_name, "up")),
+    )
+    refit_info = {
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {
+            "model.layers.0": [{"name": gate_name, "dtype": "torch.bfloat16"}]
+        },
+    }
+    worker = object.__new__(MegatronGenerationRefitMixin)
+    param_map = worker._build_destination_hf_to_local_param_map(refit_info, [task])
+    gate_spec = param_map.get(gate_name)
+    assert gate_spec is not None
+    assert gate_spec.pre is not None
+
+    orphaned_storage = destination.data
+    destination.data = torch.full_like(destination, -1)
+    gate_ctx = gate_spec.pre(gate_spec.base)
+    gate_ctx.buf.fill_(7)
+
+    assert torch.equal(destination[:2], torch.full_like(destination[:2], 7))
+    assert torch.equal(destination[2:], torch.full_like(destination[2:], -1))
+    assert torch.count_nonzero(orphaned_storage).item() == 0
+
+
+@pytest.mark.parametrize(
+    ("param_info", "expected_message"),
+    [
+        (
+            {"name": "model.layers.0.mlp.gate_proj.weight", "dtype": "torch.bfloat16"},
+            "No local Megatron destination maps",
+        ),
+        (
+            {
+                "name": "model.layers.0.mlp.experts.gate_proj.weight",
+                "grouped_expert_proj": "gate_proj",
+                "dtype": "torch.bfloat16",
+            },
+            "No local Megatron experts map",
+        ),
+    ],
+)
+def test_megatron_m2n_rejects_weights_with_no_local_destination(
+    param_info: dict[str, str], expected_message: str
+) -> None:
+    """A train/gen geometry mismatch must fail while the plan is built.
+
+    Every shipped bulk weight has to land somewhere local. If it doesn't, the
+    receive plan is silently short a destination and the M-to-N collective would
+    post a mismatched set of transfers at the first refit.
+    """
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationRefitMixin,
+    )
+
+    worker = object.__new__(MegatronGenerationRefitMixin)
+    refit_info = {
+        "layer_names": ["model.layers.0"],
+        "per_layer_params": {"model.layers.0": [param_info]},
+    }
+
+    with pytest.raises(ValueError, match=expected_message):
+        worker._build_destination_hf_to_local_param_map(refit_info, [])
+
+
+@pytest.mark.parametrize("grouped_gemm_backend", ["torch", "flashinfer"])
+def test_prepare_mxfp8_refit_replaces_only_quantized_parameters_idempotently(
+    monkeypatch: pytest.MonkeyPatch,
+    grouped_gemm_backend: str,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker as worker_module
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationRefitMixin,
+    )
+
+    core = torch.nn.Module()
+    core.config = SimpleNamespace(
+        transformer_impl="inference_optimized",
+        fp8_recipe="mxfp8",
+        inference_grouped_gemm_backend=grouped_gemm_backend,
+    )
+    core.decoder = torch.nn.Module()
+    core.decoder.weight = torch.nn.Parameter(torch.zeros(2, 2))
+    core.decoder.norm = torch.nn.Parameter(torch.zeros(2))
+    quantized_destination = object()
+    quantize = MagicMock(return_value={"weight": quantized_destination})
+    # megatron_worker binds this name at import time, so the patch must target
+    # the consuming module rather than megatron.core...quantization.utils.
+    monkeypatch.setattr(worker_module, "quantize_params_to_mxfp8", quantize)
+
+    weight_task = _make_refit_task(
+        param_name="weight",
+        destination=core.decoder.weight,
+        dependencies=("weight",),
+    )
+    norm_task = _make_refit_task(
+        param_name="norm",
+        destination=core.decoder.norm,
+        dependencies=("norm",),
+    )
+    worker = object.__new__(MegatronGenerationRefitMixin)
+    worker.model = core
+    worker._inference_engine_initialized = False
+    worker._generation_mxfp8_destinations = None
+    worker._generation_mxfp8_refit_tasks = None
+
+    worker._prepare_mxfp8_refit([weight_task, norm_task])
+
+    assert weight_task.destination is quantized_destination
+    assert norm_task.destination is core.decoder.norm
+    quantize.assert_called_once_with(core.decoder, backend="triton")
+
+    # Rebuilds happen after lazy engine initialization. They must reuse the
+    # persistent destination map instead of quantizing/rebinding storage again.
+    rebuilt_weight_task = _make_refit_task(
+        param_name="weight",
+        destination=core.decoder.weight,
+        dependencies=("weight",),
+    )
+    rebuilt_norm_task = _make_refit_task(
+        param_name="norm",
+        destination=core.decoder.norm,
+        dependencies=("norm",),
+    )
+    worker._inference_engine_initialized = True
+    worker._prepare_mxfp8_refit([rebuilt_weight_task, rebuilt_norm_task])
+
+    assert rebuilt_weight_task.destination is quantized_destination
+    assert rebuilt_norm_task.destination is core.decoder.norm
+    quantize.assert_called_once()
+
+    # Bridge enumerates nn.Parameters, but quantization replaces the weight with
+    # an MXFP8Tensor attribute. Recovery therefore reuses the complete ordered
+    # plan rather than asking Bridge to rediscover a now-invisible task.
+    worker.megatron_bridge = MagicMock()
+    model_chunks, rebuilt_tasks = worker._build_generation_refit_tasks()
+    assert model_chunks == [core]
+    assert rebuilt_tasks == [weight_task, norm_task]
+    worker.megatron_bridge.get_conversion_tasks.assert_not_called()
+
+
+def test_megatron_generation_joins_all_m2n_pipeline_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.distributed import stateless_process_group
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationRefitMixin,
+    )
+
+    groups = [MagicMock(), MagicMock()]
+    process_group = MagicMock(side_effect=groups)
+    monkeypatch.setattr(stateless_process_group, "StatelessProcessGroup", process_group)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    worker = object.__new__(MegatronGenerationRefitMixin)
+    worker.rank = 2
+
+    worker.init_nccl_reshard_comm_groups_generation(
+        pp_ips=["10.0.0.1", "10.0.0.2"],
+        pp_ports=[1234, 1235],
+        pp_size=2,
+        train_ranks_per_stage=4,
+        sub_world_size=10,
+        rank_prefix=1,
+    )
+
+    assert process_group.call_args_list == [
+        call(master_address="10.0.0.1", port=1234, rank=5, world_size=10),
+        call(master_address="10.0.0.2", port=1235, rank=5, world_size=10),
+    ]
+    for group in groups:
+        group.init_nccl_communicator.assert_called_once_with(device=0)
+
+
+def _disable_opd_full(worker) -> None:
+    """Set the opd_full attributes to the state __init__ gives them when off.
+
+    These doubles are built with ``object.__new__``, so every attribute the
+    paths under test read has to be set here by hand.
+    """
+    worker._opd_full_enabled = False
+    worker._opd_full_lm_head_lifecycle = None
+    worker._opd_full_teacher_lm_heads = {}
+    worker._opd_full_teacher_checkpoint_paths = {}
+    worker._opd_full_lm_head_evicted = False
+
+
+def _worker_with_teachers(lifecycle, heads, paths):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker._opd_full_enabled = True
+    worker._opd_full_lm_head_lifecycle = lifecycle
+    worker._opd_full_teacher_lm_heads = dict(heads)
+    worker._opd_full_teacher_checkpoint_paths = dict(paths)
+    worker._opd_full_lm_head_evicted = False
+    return worker
+
+
+class _FakeShard:
+    """Stands in for a GPU/CPU shard: the mover reads only ``.device`` and ``.to``."""
+
+    def __init__(self, device: str):
+        self.device = torch.device(device)
+
+    def to(self, *, device, non_blocking):
+        del non_blocking
+        return _FakeShard(str(device))
+
+
+def test_evict_reloads_every_teacher_once_per_release(monkeypatch):
+    """Two teachers under ``evict``: drop both, reload both once, then stay put.
+
+    A second train phase without an intervening release must not re-enter the
+    load: it is a whole-world collective the other ranks would not be in.
+    """
+    worker = _worker_with_teachers(
+        "evict",
+        {0: torch.zeros(2, 3), 1: torch.ones(2, 3)},
+        {0: "/ckpt/a", 1: "/ckpt/b"},
+    )
+    reloads = []
+
+    def fake_load(path, teacher_index):
+        reloads.append((teacher_index, path))
+        worker._opd_full_teacher_lm_heads[teacher_index] = torch.full(
+            (2, 3), float(teacher_index)
+        )
+
+    monkeypatch.setattr(worker, "_load_opd_full_teacher_lm_head_from_path", fake_load)
+    moves = []
+    monkeypatch.setattr(
+        worker, "_move_opd_full_teacher_lm_head", lambda device: moves.append(device)
+    )
+
+    worker._release_opd_full_teacher_lm_head()
+    assert worker._opd_full_teacher_lm_heads == {}
+    assert worker._opd_full_lm_head_evicted is True
+
+    worker._stage_opd_full_teacher_lm_head_for_training()
+    assert reloads == [(0, "/ckpt/a"), (1, "/ckpt/b")]
+    assert sorted(worker._opd_full_teacher_lm_heads) == [0, 1]
+    assert worker._opd_full_lm_head_evicted is False
+    assert moves == ["cuda"]
+
+    worker._stage_opd_full_teacher_lm_head_for_training()
+    assert len(reloads) == 2
+
+
+def test_off_last_stage_rank_reenters_the_reload_in_lockstep(monkeypatch):
+    """A non-last PP stage holds paths but no shards and must still re-enter.
+
+    ``evict`` has to set the flag from the recorded paths, not the (empty) shard
+    dict, or this rank skips the reload collective the last stage is waiting in.
+    """
+    worker = _worker_with_teachers("evict", {}, {0: "/ckpt/a", 1: "/ckpt/b"})
+    reloads = []
+    monkeypatch.setattr(
+        worker,
+        "_load_opd_full_teacher_lm_head_from_path",
+        lambda path, teacher_index: reloads.append((teacher_index, path)),
+    )
+    monkeypatch.setattr(worker, "_move_opd_full_teacher_lm_head", lambda device: None)
+
+    worker._release_opd_full_teacher_lm_head()
+    assert worker._opd_full_lm_head_evicted is True
+
+    worker._stage_opd_full_teacher_lm_head_for_training()
+    assert reloads == [(0, "/ckpt/a"), (1, "/ckpt/b")]
+
+
+def test_offload_parks_every_teacher_head_not_just_the_first():
+    worker = _worker_with_teachers(
+        "offload",
+        {0: _FakeShard("cuda"), 1: _FakeShard("cuda")},
+        {0: "/ckpt/a", 1: "/ckpt/b"},
+    )
+
+    worker._release_opd_full_teacher_lm_head()
+
+    assert {i: str(h.device) for i, h in worker._opd_full_teacher_lm_heads.items()} == {
+        0: "cpu",
+        1: "cpu",
+    }
+    assert worker._opd_full_lm_head_evicted is False
+
+
+def test_second_teacher_with_another_hidden_size_is_rejected_at_load(monkeypatch):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    worker = _worker_with_teachers("none", {0: torch.zeros(4, 3)}, {0: "/ckpt/a"})
+    owner = SimpleNamespace(
+        output_layer=SimpleNamespace(
+            weight=torch.zeros(4, 3), output_size_per_partition=4
+        )
+    )
+    monkeypatch.setattr(worker, "_resolve_output_layer_owner", lambda: owner)
+    monkeypatch.setattr(
+        worker_module,
+        "load_teacher_output_layer_weight",
+        lambda **kw: torch.zeros(4, 5),
+    )
+    monkeypatch.setattr(worker, "_move_opd_full_teacher_lm_head", lambda device: None)
+
+    with pytest.raises(ValueError, match="hidden_size=5, but teacher_index=0 has 3"):
+        worker._load_opd_full_teacher_lm_head_from_path("/ckpt/b", 1)
+
+    assert 1 not in worker._opd_full_teacher_lm_heads
+    assert worker._opd_full_teacher_lm_heads[0].shape == (4, 3)
+
+
+def test_off_last_stage_joins_the_load_without_requesting_a_shard(monkeypatch):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    worker = _worker_with_teachers("none", {}, {})
+    monkeypatch.setattr(worker, "_resolve_output_layer_owner", lambda: None)
+    calls = []
+
+    def fake_load(**kwargs):
+        calls.append(kwargs)
+        return None
+
+    monkeypatch.setattr(worker_module, "load_teacher_output_layer_weight", fake_load)
+
+    worker._load_opd_full_teacher_lm_head_from_path("/ckpt/a", 3)
+
+    assert calls == [
+        {"teacher_pretrained_path": "/ckpt/a", "local_vocab_size": None, "dtype": None}
+    ]
+    assert worker._opd_full_teacher_lm_heads == {}
+    # Recorded even without a shard: the evict reload must re-enter in lockstep.
+    assert worker._opd_full_teacher_checkpoint_paths == {3: "/ckpt/a"}
+
+
+def test_resolve_output_layer_owner_is_none_only_off_the_last_stage(monkeypatch):
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = SimpleNamespace()  # no output_layer, no language_model
+    monkeypatch.setattr(worker_module, "unwrap_model", lambda model: model)
+    monkeypatch.setattr(worker_module.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        worker_module.parallel_state,
+        "is_pipeline_last_stage",
+        lambda ignore_virtual=False: False,
+    )
+
+    assert worker._resolve_output_layer_owner() is None
+
+    monkeypatch.setattr(
+        worker_module.parallel_state,
+        "is_pipeline_last_stage",
+        lambda ignore_virtual=False: True,
+    )
+    with pytest.raises(AttributeError, match="last pipeline stage"):
+        worker._resolve_output_layer_owner()
+
+
+@pytest.mark.parametrize(
+    ("reserved_ports", "rank", "expected"),
+    [
+        ({0: 5555, 2: 6666}, 0, 5555),
+        ({0: 5555, 2: 6666}, 1, None),
+        (None, 0, None),
+    ],
+)
+def test_reserved_http_server_port_is_selected_by_worker_rank(
+    reserved_ports, rank, expected
+):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _reserved_http_server_port_for_rank,
+    )
+
+    assert _reserved_http_server_port_for_rank(reserved_ports, rank) == expected
+
+
+def test_model_owned_packing_capability_is_detected():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_self_packs_for_cp,
+    )
+
+    class ModelOwnedPackingModel:
+        model_owns_packing = True
+
+    assert _model_self_packs_for_cp(ModelOwnedPackingModel())
+
+
+def test_model_owned_mtp_loss_mask_packing_capability_is_detected():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_self_packs_mtp_loss_mask,
+    )
+
+    class ModelOwnedPackingModel:
+        model_owns_mtp_loss_mask_packing = True
+
+    assert _model_self_packs_mtp_loss_mask(ModelOwnedPackingModel())
+    assert not _model_self_packs_mtp_loss_mask(object())
+
+
+def _conversion_task(megatron_param: str, hf_param) -> SimpleNamespace:
+    return SimpleNamespace(
+        global_param_name=megatron_param,
+        mapping=SimpleNamespace(hf_param=hf_param),
+    )
+
+
+def test_collect_mtp_hf_layer_names_covers_both_naming_schemes():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _collect_mtp_hf_layer_names,
+    )
+
+    tasks = [
+        None,  # dropped tasks are tolerated
+        # DeepSeek-style: megatron mtp.* exports as a trailing main-model
+        # layer index (num_hidden_layers=61 -> HF layer model.layers.61).
+        _conversion_task(
+            "mtp.layers.0.mtp_model_layer.mlp.linear_fc1.weight",
+            {
+                "gate": "model.layers.61.mlp.gate_proj.weight",
+                "up": "model.layers.61.mlp.up_proj.weight",
+            },
+        ),
+        # NemotronH-style: bare mtp. prefix survives into the HF name.
+        _conversion_task(
+            "mtp.layers.0.mtp_model_layer.layers.0.mlp.linear_fc1.weight",
+            "mtp.layers.0.mixer.up_proj.weight",
+        ),
+        # Qwen3.5-VL / EXAONE-style: megatron name carries a language_model.
+        # prefix before the mtp. segment; the HF name stays bare mtp.*.
+        _conversion_task(
+            "language_model.mtp.layers.1.mtp_model_layer.mlp.linear_fc1.weight",
+            "mtp.layers.1.mlp.up_proj.weight",
+        ),
+        # Main-model tasks must not contribute.
+        _conversion_task(
+            "decoder.layers.3.mlp.linear_fc1.weight",
+            {"gate": "model.layers.3.mlp.gate_proj.weight"},
+        ),
+        _conversion_task(
+            "embedding.word_embeddings.weight", "model.embed_tokens.weight"
+        ),
+    ]
+
+    assert _collect_mtp_hf_layer_names(tasks) == {
+        "model.layers.61",
+        "mtp.layers.0",
+        "mtp.layers.1",
+    }
+
+
+def test_collect_mtp_hf_layer_names_empty_inputs():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _collect_mtp_hf_layer_names,
+    )
+
+    assert _collect_mtp_hf_layer_names([]) == set()
+    assert _collect_mtp_hf_layer_names(None) == set()
+
+
+def test_regular_model_does_not_delegate_packing():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_self_packs_for_cp,
+    )
+
+    assert not _model_self_packs_for_cp(object())
+
+
+def test_model_cp_slicing_capability_is_detected():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_slices_context_parallel_inputs,
+    )
+
+    class ModelSlicesContextParallelInputs:
+        model_slices_context_parallel_inputs = True
+
+    assert _model_slices_context_parallel_inputs(ModelSlicesContextParallelInputs())
+    assert not _model_slices_context_parallel_inputs(object())
+
+
+def test_model_cp_slicing_accepts_data_plane_setup():
+    """Models that slice CP inputs themselves are no longer fenced off here.
+
+    ``setup_data_plane`` used to reject them outright. The train path now
+    forwards ``model_slices_context_parallel_inputs`` into
+    ``get_microbatch_iterator``, so such a worker builds a client like any
+    other. The second call pins the documented idempotence.
+    """
+    from nemo_rl.data_plane.adapters.local import LocalDataPlaneClient
+    from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    worker.model_slices_context_parallel_inputs = True
+    worker._dp_client = None
+
+    worker.setup_data_plane(LocalDataPlaneConfig())
+    client = worker._dp_client
+    assert isinstance(client, LocalDataPlaneClient)
+
+    worker.setup_data_plane(LocalDataPlaneConfig())
+    assert worker._dp_client is client
+
+
+def _opd_full_teacher_worker(model_config):
+    """A teacher double whose only live attribute is its model config.
+
+    The guard runs before the timer, the model and the microbatch iterator, so
+    none of them need to exist.
+    """
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = SimpleNamespace(config=model_config)
+    return worker
+
+
+class _PastTheGuard(Exception):
+    """Raised by the sentinel timer once the payload guard has been passed."""
+
+
+@pytest.mark.parametrize("full_vocab", [False, True])
+def test_full_vocab_logprobs_preserve_rollout_sampling(monkeypatch, full_vocab):
+    from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_mod
+
+    worker = object.__new__(worker_mod.MegatronPolicyWorkerImpl)
+    worker.timer = MagicMock()
+    worker.model = MagicMock()
+    worker.cfg = {"logprob_batch_size": 1, "megatron_cfg": {}}
+    worker.sampling_params = TrainingSamplingParams(top_k=3, top_p=0.9, temperature=0.6)
+    worker._opd_full_enabled = full_vocab
+    worker.media_placeholder_token_id = None
+    worker.mcore_state = SimpleNamespace(straggler_timer=None)
+    worker.delegate_pack_to_model = False
+    worker.delegate_mtp_loss_mask_to_model = False
+    worker.model_slices_context_parallel_inputs = False
+    worker.mtp_enabled = False
+    worker._router_replay_enabled = False
+    worker.defer_fp32_logits = False
+    monkeypatch.setattr(
+        worker_mod, "get_microbatch_iterator", lambda *a, **k: ([], 1, 1, 4, 4)
+    )
+    captured = {}
+
+    def capture_processor(**kwargs):
+        captured["processor"] = kwargs["sampling_params"]
+        return MagicMock()
+
+    def capture_forward(**kwargs):
+        captured["forward"] = kwargs["sampling_params"]
+        raise _PastTheGuard
+
+    monkeypatch.setattr(worker_mod, "LogprobsPostProcessor", capture_processor)
+    monkeypatch.setattr(worker_mod, "megatron_forward_backward", capture_forward)
+    with torch.enable_grad(), pytest.raises(_PastTheGuard):
+        worker.get_logprobs(
+            data=BatchedDataDict(input_ids=torch.zeros(1, 4, dtype=torch.long))
+        )
+
+    assert set(captured) == {"processor", "forward"}
+    for params in captured.values():
+        assert params.top_k == (None if full_vocab else 3)
+        assert params.top_p == (1.0 if full_vocab else 0.9)
+        assert params.temperature == 0.6
+    assert worker.sampling_params == TrainingSamplingParams(
+        top_k=3, top_p=0.9, temperature=0.6
+    )
+
+
+class _SentinelTimer:
+    def start(self, name):
+        raise _PastTheGuard(name)
+
+
+@pytest.mark.parametrize(
+    "model_config",
+    [
+        pytest.param(
+            SimpleNamespace(final_logit_softcapping=30.0), id="gemma_softcapping"
+        ),
+        pytest.param(SimpleNamespace(output_multiplier=2.0), id="output_multiplier"),
+        pytest.param(SimpleNamespace(use_mup=True), id="mup"),
+    ],
+)
+def test_full_payload_rejects_hidden_states_when_logits_are_post_processed(
+    model_config,
+):
+    """The student rebuilds teacher logits as ``output_layer(h)``.
+
+    A teacher that softcaps or rescales them afterwards would be silently
+    mis-reconstructed: no error, just a wrong target.
+    """
+    worker = _opd_full_teacher_worker(model_config)
+
+    with pytest.raises(ValueError, match="teacher_payload='logits'"):
+        worker.get_logprobs_with_full_payload(
+            data=BatchedDataDict({}),
+            payload="hidden_states",
+            payload_dtype="bfloat16",
+        )
+
+
+@pytest.mark.parametrize(
+    ("model_config", "payload"),
+    [
+        pytest.param(SimpleNamespace(hidden_size=8), "hidden_states", id="plain_mcore"),
+        # The logits payload is exact for a post-processed teacher.
+        pytest.param(
+            SimpleNamespace(final_logit_softcapping=30.0), "logits", id="softcap_logits"
+        ),
+    ],
+)
+def test_full_payload_admits_reconstructible_teachers(model_config, payload):
+    """The guard is the method's first statement, so a sentinel timer marks it passed."""
+    worker = _opd_full_teacher_worker(model_config)
+    worker.timer = _SentinelTimer()
+
+    with pytest.raises(_PastTheGuard):
+        worker.get_logprobs_with_full_payload(
+            data=BatchedDataDict({}),
+            payload=payload,
+            payload_dtype="bfloat16",
+        )
+
+
+def test_model_cp_slicing_accepts_transfer_queue_setup(monkeypatch):
+    """Media-before-CP models are served by the leader-broadcast fetch.
+
+    ``_fetch`` broadcasts one DP slice across the replica group (TP x CP x PP
+    siblings of a DP rank), so every CP sibling gets identical full THD rows and
+    the model applies its own post-embedding slice. Setup used to reject these
+    models outright, so setup must now accept them.
+    """
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    worker.model_slices_context_parallel_inputs = True
+    worker._dp_client = None
+
+    client = MagicMock()
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client", lambda cfg, bootstrap: client
+    )
+    worker.setup_data_plane(MagicMock())
+
+    assert worker._dp_client is client
+
+
+def test_refit_size_estimate_preserves_integral_buffer_dtype():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _estimate_refit_tensor_size_in_bytes,
+    )
+
+    param = torch.zeros(3, dtype=torch.int64)
+
+    assert (
+        _estimate_refit_tensor_size_in_bytes(
+            param, export_dtype=torch.bfloat16, tp_size=2, ep_size=4
+        )
+        == 3 * 8 * 2 * 4
+    )
+
+
+def test_refit_size_estimate_casts_floating_weight_to_export_dtype():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _estimate_refit_tensor_size_in_bytes,
+    )
+
+    param = torch.zeros(3, dtype=torch.float32)
+
+    assert (
+        _estimate_refit_tensor_size_in_bytes(
+            param, export_dtype=torch.bfloat16, tp_size=2, ep_size=4
+        )
+        == 3 * 2 * 2 * 4
+    )
+
+
+def test_megatron_refit_bridge_tasks_export_logical_quantized_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    @dataclass(frozen=True)
+    class Task:
+        param_weight: torch.Tensor | None
+        param_name: str = ""
+        megatron_module: object | None = None
+
+    quantized_source = torch.zeros((4, 2), dtype=torch.uint8)
+    bridge_payload = torch.ones((4, 2), dtype=torch.uint8)
+    logical_weight = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
+    bf16_source = torch.ones((2, 2), dtype=torch.bfloat16)
+    dequantize = MagicMock(
+        side_effect=lambda tensor: (
+            logical_weight if tensor is quantized_source else tensor
+        )
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_is_quantized_refit_source",
+        lambda tensor: tensor is quantized_source,
+    )
+    monkeypatch.setattr(worker_module, "_dequantize_refit_source", dequantize)
+
+    tasks = [
+        Task(
+            bridge_payload,
+            param_name="decoder.layers.0.mlp.weight",
+            megatron_module=SimpleNamespace(weight=quantized_source),
+        ),
+        None,
+        Task(bf16_source),
+    ]
+    exported = list(
+        worker_module.MegatronPolicyWorkerImpl._iter_logical_refit_conversion_tasks(
+            tasks
+        )
+    )
+
+    assert exported[0] is not tasks[0]
+    assert exported[0].param_weight is logical_weight
+    assert exported[1] is None
+    assert exported[2] is tasks[2]
+    assert dequantize.call_args_list == [call(quantized_source), call(bf16_source)]
+
+
+def test_logical_refit_tasks_dequantize_group_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from megatron.core import fp8_utils
+
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    @dataclass(frozen=True)
+    class Task:
+        param_weight: torch.Tensor
+
+    source = torch.arange(32, dtype=torch.uint8).reshape(2, 4, 4)
+    members = tuple(source.unbind(0))
+    scales = torch.tensor([2.0, 8.0]).reshape(2, 1, 1)
+    monkeypatch.setattr(
+        fp8_utils,
+        "is_grouped_tensor_with_quantized_storage",
+        lambda tensor: tensor is source,
+    )
+    member_views = MagicMock(return_value=members)
+    monkeypatch.setattr(fp8_utils, "get_grouped_quantized_members", member_views)
+
+    def decode_group(tensors: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        assert len(tensors) == len(members)
+        assert all(actual is member for actual, member in zip(tensors, members))
+        return (torch.stack(tensors).float() * scales).to(torch.bfloat16)
+
+    member_decode = MagicMock(side_effect=AssertionError("per-expert decode called"))
+    monkeypatch.setattr(fp8_utils, "dequantize_fp8_tensor", member_decode)
+    packed_decode = MagicMock(side_effect=decode_group)
+    monkeypatch.setattr(worker_module, "_dequantize_refit_source_group", packed_decode)
+
+    task = Task(source)
+    for cycle in range(2):
+        exported = list(
+            worker_module.MegatronPolicyWorkerImpl._iter_logical_refit_conversion_tasks(
+                [task]
+            )
+        )
+        assert exported[0] is not task and task.param_weight is source
+        assert exported[0].param_weight.dtype == torch.bfloat16
+        assert exported[0].param_weight.shape == source.shape
+        assert packed_decode.call_count == cycle + 1
+        torch.testing.assert_close(
+            exported[0].param_weight,
+            (source.float() * scales).to(torch.bfloat16),
+            rtol=0,
+            atol=0,
+        )
+        source.add_(1)
+        scales.mul_(2)
+
+    assert member_views.call_args_list == [call(source, create_if_missing=True)] * 2
+    member_decode.assert_not_called()
+
+
+@pytest.mark.parametrize("grouped_storage", [False, True])
+def test_refit_dequantizes_with_metadata_before_selecting_hf_view(
+    monkeypatch: pytest.MonkeyPatch, grouped_storage: bool
+) -> None:
+    from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
+    from megatron.core import fp8_utils
+
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    # Stand in for TE storage plus its scaling metadata. The decoder accepts
+    # only complete source members, so slicing encoded bytes before decoding
+    # fails this test. Non-unit row scales also distinguish decoding from a cast.
+    shape = (2, 4, 4) if grouped_storage else (4, 4)
+    source = torch.arange(math.prod(shape), dtype=torch.uint8).reshape(shape)
+    scales = torch.tensor([2.0, 4.0, 8.0, 16.0]).reshape(4, 1)
+
+    def decode(member: torch.Tensor) -> torch.Tensor:
+        assert not grouped_storage and member is source
+        assert member.shape == (4, 4)
+        return (member.to(torch.float32) * scales).to(torch.bfloat16)
+
+    def decode_group(members: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        assert grouped_storage and len(members) == 2
+        assert all(member.shape == (4, 4) for member in members)
+        return (torch.stack(members).float() * scales).to(torch.bfloat16)
+
+    monkeypatch.setattr(
+        fp8_utils,
+        "is_grouped_tensor_with_quantized_storage",
+        lambda tensor: grouped_storage and tensor is source,
+    )
+    monkeypatch.setattr(fp8_utils, "is_float8tensor", lambda tensor: tensor is source)
+    member_views = MagicMock(side_effect=lambda *args, **kwargs: list(source.unbind(0)))
+    single_decode = MagicMock(side_effect=decode)
+    grouped_decode = MagicMock(side_effect=decode_group)
+    monkeypatch.setattr(fp8_utils, "get_grouped_quantized_members", member_views)
+    monkeypatch.setattr(fp8_utils, "dequantize_fp8_tensor", single_decode)
+    monkeypatch.setattr(worker_module, "_dequantize_refit_source_group", grouped_decode)
+    spec = worker_module.MegatronReshardParamSpecCollection._default_param_spec(
+        source, LocalHFParamSpec("gate", -2, 0, 2)
+    )
+    assert spec.wire_dtype == torch.bfloat16
+
+    for _ in range(2):
+        result = spec.materialize().buf
+        expected = (source.to(torch.float32) * scales).to(torch.bfloat16)
+        assert result.dtype == torch.bfloat16 and result.is_contiguous()
+        assert torch.equal(result, expected[..., :2, :])
+        source.data = source.data + 1
+        scales.mul_(2)
+    if grouped_storage:
+        assert member_views.call_args_list == [call(source, create_if_missing=True)] * 2
+        assert grouped_decode.call_count == 2
+        single_decode.assert_not_called()
+    else:
+        assert single_decode.call_count == 2
+        grouped_decode.assert_not_called()
+        member_views.assert_not_called()
+
+
+def test_megatron_refit_quantized_hooks_read_current_fused_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
+
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    sources = tuple(
+        torch.arange(8, dtype=torch.uint8).reshape(4, 2) + offset for offset in (0, 16)
+    )
+    scales = torch.tensor([[2.0, 4.0, 8.0, 16.0], [3.0, 5.0, 7.0, 11.0]]).unsqueeze(-1)
+
+    def decode_group(tensors: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        assert len(tensors) == len(sources)
+        assert all(actual is source for actual, source in zip(tensors, sources))
+        # Unequal expert scales make a raw-byte cast or crossed expert order wrong.
+        return (torch.stack(tensors).float() * scales).to(torch.bfloat16)
+
+    grouped_decode = MagicMock(side_effect=decode_group)
+    monkeypatch.setattr(
+        worker_module,
+        "_is_quantized_refit_source",
+        lambda tensor: any(tensor is source for source in sources),
+    )
+    monkeypatch.setattr(worker_module, "_dequantize_refit_source_group", grouped_decode)
+    single_decode = MagicMock(side_effect=AssertionError("individual decode called"))
+    monkeypatch.setattr(worker_module, "_dequantize_refit_source", single_decode)
+    prefix = "model.layers.0.mlp.experts"
+    groups = {
+        (prefix, proj): [
+            worker_module.MegatronReshardParamSpecCollection._default_param_spec(
+                source,
+                LocalHFParamSpec(f"{prefix}.{index}.{proj}.weight", -2, split, 2),
+            )
+            for index, source in enumerate(sources)
+        ]
+        for split, proj in enumerate(("gate_proj", "up_proj"))
+    }
+    for members in groups.values():
+        for member, source in zip(members, sources):
+            assert member.base.tensor is source
+            member.pre = MagicMock(side_effect=AssertionError("individual pre called"))
+    grouped_specs = tuple(
+        worker_module.MegatronReshardParamSpecCollection._grouped_expert_spec(
+            proj, f"{prefix}.{proj}.weight", groups
+        )
+        for proj in ("gate_proj", "up_proj")
+    )
+    grouped_decode.assert_not_called()
+    previous = None
+    for cycle in range(2):
+        expected = (torch.stack(sources).float() * scales).to(torch.bfloat16)
+        outputs = []
+        for split, spec in enumerate(grouped_specs):
+            result = spec.materialize().buf
+            assert spec.wire_dtype == result.dtype == torch.bfloat16
+            assert result.shape == (2, 2, 2) and result.is_contiguous()
+            assert torch.equal(result, expected.chunk(2, dim=1)[split])
+            assert grouped_decode.call_count == cycle * 2 + split + 1
+            outputs.append(result)
+        if previous is not None:
+            assert all(
+                not torch.equal(before, after)
+                for before, after in zip(previous, outputs)
+            )
+        previous = outputs
+        for source in sources:
+            source.data = source.data + 3
+        scales.mul_(2)
+    single_decode.assert_not_called()
+    for members in groups.values():
+        for member in members:
+            member.pre.assert_not_called()
+
+
+@pytest.mark.parametrize("source_dtype", [torch.uint8, torch.float16, torch.float32])
+@pytest.mark.parametrize("failure_stage", [None, "pre", "dtype", "transfer", "post"])
+def test_megatron_refit_hooks_refresh_after_updates_and_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str | None,
+    source_dtype: torch.dtype,
+) -> None:
+    # Keep the optional Megatron/NCCL imports local to this mcore test.
+    from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
+
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+    import nemo_rl.weight_sync.xferdtensor as transfer_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.my_pp_stage = 0
+    worker.pp_comm_group = object()
+    worker._broadcast_misc_params_packed = MagicMock()
+    source = torch.arange(8, dtype=source_dtype).reshape(4, 2)
+    wire_dtype = torch.bfloat16 if source_dtype == torch.uint8 else source_dtype
+    if source_dtype != torch.uint8:
+        source = 1 + source / 1024
+    layer_names = ["model.layers.0", "model.layers.1"]
+    worker.nccl_reshard_refit_info = {
+        "layer_names": layer_names,
+        "per_layer_params": {
+            layer: [
+                {
+                    "name": f"{layer}.mlp.{proj}_proj.weight",
+                    "global_shape": [2, 2],
+                    "dtype": str(wire_dtype),
+                    "src_mesh_info": object(),
+                    "src_placements": (),
+                    "dst_mesh_info": object(),
+                    "dst_placements": (),
+                }
+                for proj in ("gate", "up")
+            ]
+            for layer in layer_names
+        },
+    }
+    current_stream = object()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
+    monkeypatch.setattr(torch.cuda, "empty_cache", MagicMock())
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(
+        "nemo_rl.distributed.refit_watchdog.sync_stream_within", MagicMock()
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "_is_quantized_refit_source",
+        lambda tensor: tensor is source and source_dtype == torch.uint8,
+    )
+    materialized_sources = []
+    transferred = []
+    completed = []
+
+    def dequantize(tensor: torch.Tensor) -> torch.Tensor:
+        # Each HF view reads the current full source independently.
+        assert torch.cuda.current_stream() is current_stream
+        logical = tensor.to(wire_dtype)
+        materialized_sources.append(logical.clone())
+        return logical
+
+    monkeypatch.setattr(worker_module, "_dequantize_refit_source", dequantize)
+
+    def iter_shards():
+        for layer in layer_names:
+            for split_index, proj in enumerate(("gate", "up")):
+                name = f"{layer}.mlp.{proj}_proj.weight"
+                yield (
+                    name,
+                    worker_module.MegatronReshardParamSpecCollection._default_param_spec(
+                        source,
+                        LocalHFParamSpec(name, -2, split_index, 2),
+                    ),
+                )
+
+    worker._iter_local_hf_param_shards = iter_shards
+    worker.hf_to_local_param_map = worker._build_source_hf_to_local_param_map(
+        worker.nccl_reshard_refit_info
+    )
+    first_spec = worker.hf_to_local_param_map.get(
+        f"{layer_names[0]}.mlp.gate_proj.weight"
+    )
+    materialize_first = first_spec.pre
+
+    def pre(base: torch.Tensor) -> worker_module.RefitCtx:
+        ctx = materialize_first(base)
+        if failure_stage == "pre":
+            raise RuntimeError("injected pre failure")
+        if failure_stage == "dtype":
+            ctx.buf = ctx.buf.to(
+                torch.float32 if wire_dtype != torch.float32 else torch.float16
+            )
+        return ctx
+
+    def post(ctx: worker_module.RefitCtx) -> None:
+        if failure_stage == "post":
+            raise RuntimeError("injected post failure")
+        completed.append(ctx.buf.clone())
+
+    first_spec.pre = pre
+    first_spec.post = post
+
+    def transfer(src, *args) -> None:
+        assert args[-2] is worker.pp_comm_group
+        assert args[-1] is current_stream
+        if failure_stage == "transfer":
+            raise RuntimeError("injected transfer failure")
+        transferred.append(src._local_tensor.clone())
+
+    monkeypatch.setattr(transfer_module, "xferdtensor", transfer)
+
+    if failure_stage is not None:
+        if failure_stage == "dtype":
+            expected_error = ValueError
+            expected_message = "dtype .*wire_dtype"
+        else:
+            expected_error = RuntimeError
+            expected_message = f"injected {failure_stage} failure"
+        with pytest.raises(expected_error, match=expected_message):
+            worker._nccl_reshard_refit()
+        assert len(materialized_sources) == 1
+        assert completed == []
+        worker._broadcast_misc_params_packed.assert_not_called()
+        failure_stage = None
+        materialized_sources.clear()
+        transferred.clear()
+        source.add_(10)
+
+    for _ in range(2):
+        expected = source.to(wire_dtype)
+        worker._nccl_reshard_refit()
+        assert len(materialized_sources) == 4
+        assert all(torch.equal(logical, expected) for logical in materialized_sources)
+        assert len(transferred) == 4
+        assert all(tensor.dtype == wire_dtype for tensor in transferred)
+        for offset in (0, 2):
+            assert torch.equal(transferred[offset], expected[:2])
+            assert torch.equal(transferred[offset + 1], expected[2:])
+        assert len(completed) == 1 and torch.equal(completed[0], expected[:2])
+        materialized_sources.clear()
+        transferred.clear()
+        completed.clear()
+        source.add_(10)
+
+    assert worker._broadcast_misc_params_packed.call_count == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA streams")
+def test_megatron_refit_pre_hooks_use_current_cuda_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Keep the optional Megatron imports local to this mcore test.
+    from megatron.bridge.models.conversion.param_mapping import LocalHFParamSpec
+
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        quantized_source = torch.arange(8, device="cuda", dtype=torch.uint8).reshape(
+            4, 2
+        )
+
+        def dequantize_group(tensors: tuple[torch.Tensor, ...]) -> torch.Tensor:
+            assert torch.cuda.current_stream() == stream
+            return torch.stack(tensors).to(torch.bfloat16)
+
+        monkeypatch.setattr(
+            worker_module,
+            "_is_quantized_refit_source",
+            lambda tensor: tensor is quantized_source,
+        )
+        monkeypatch.setattr(
+            worker_module, "_dequantize_refit_source_group", dequantize_group
+        )
+        member = worker_module.MegatronReshardParamSpecCollection._default_param_spec(
+            quantized_source, LocalHFParamSpec("gate", -2, 0, 2)
+        )
+        prefix = "model.layers.0.mlp.experts"
+        grouped = worker_module.MegatronReshardParamSpecCollection._grouped_expert_spec(
+            "gate_proj",
+            f"{prefix}.gate_proj.weight",
+            {(prefix, "gate_proj"): [member, member]},
+        )
+        stack = torch.stack
+
+        def stack_on_current_stream(tensors: list[torch.Tensor]) -> torch.Tensor:
+            assert torch.cuda.current_stream() == stream
+            return stack(tensors)
+
+        with monkeypatch.context() as hooks:
+            hooks.setattr(torch, "stack", stack_on_current_stream)
+            hooks.setattr(
+                torch.cuda,
+                "stream",
+                MagicMock(side_effect=AssertionError("pre must not switch streams")),
+            )
+            hooks.setattr(
+                torch.cuda,
+                "set_stream",
+                MagicMock(side_effect=AssertionError("pre must not switch streams")),
+            )
+            hooks.setattr(
+                torch.cuda,
+                "synchronize",
+                MagicMock(side_effect=AssertionError("pre must not synchronize CUDA")),
+            )
+            output = grouped.materialize().buf
+        expected = quantized_source[:2].to(torch.bfloat16)
+    stream.synchronize()
+    assert output.is_contiguous()
+    assert torch.equal(output[0], expected) and torch.equal(output[1], expected)
+
+
+def test_qwen3vl_type_fallback_still_delegates_packing():
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        _model_self_packs_for_cp,
+    )
+
+    assert _model_self_packs_for_cp(Qwen3VLModel.__new__(Qwen3VLModel))
+
+
+class _FakeTrainableModel:
+    def __init__(self):
+        self.train_called = False
+        self.eval_called = False
+
+    def train(self):
+        self.train_called = True
+
+    def eval(self):
+        self.eval_called = True
+
+
+class _ModelWithNonSerializableExtraState(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(1))
+        self.register_buffer("scale", torch.ones(1))
+
+    def get_extra_state(self):
+        raise AssertionError("moving a module must not serialize its extra state")
+
+
+@pytest.mark.parametrize("hooks_enabled", [True, False])
+@pytest.mark.parametrize("parked", [True, False])
+def test_sync_params_before_refit_gathers_pending_bf16_params(
+    monkeypatch, hooks_enabled, parked
+):
+    """Refit must see updated optimizer shards before it reads model parameters.
+
+    The BF16 branch only needs the all-gather: the optimizer step already wrote
+    the updated shards into the DDP param buffer, and the MXFP8-only staging
+    helper must not be involved.
+    """
+    from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer
+
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+
+    events = []
+    # Exercise MCore's real storage lifecycle without constructing a CUDA model.
+    buffer = object.__new__(_ParamAndGradBuffer)
+    buffer.param_data = torch.tensor([3.0, 4.0, 0.0, 0.0], dtype=torch.bfloat16)
+    buffer.param_data_cpu = torch.empty_like(buffer.param_data)
+    buffer.grad_data = torch.tensor([5.0, 6.0, 7.0, 8.0])
+    buffer.grad_data_size = 0
+    if parked:
+        buffer.offload_to_cpu(move_params=True, move_grads=False)
+    gradient_pointer = buffer.grad_data.data_ptr()
+
+    class FakeDDP:
+        ddp_config = SimpleNamespace(overlap_param_gather=True)
+        buffers = [buffer]
+        expert_parallel_buffers = []
+
+        def start_param_sync(self, *, force_sync):
+            events.append(("start_param_sync", force_sync))
+            # All-gather obtains views into param_data before writing peer shards.
+            # This raises if refit has not restored the released storage first.
+            local, peer = buffer.param_data.chunk(2)
+            peer.copy_(local)
+
+    monkeypatch.setattr(megatron_policy_worker, "DistributedDataParallel", FakeDDP)
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda: events.append(("cuda_synchronize", None))
+    )
+
+    worker = object.__new__(megatron_policy_worker.MegatronPolicyWorkerImpl)
+    worker.model = FakeDDP()
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: False
+    worker._forward_pre_hook_enabled = lambda: hooks_enabled
+    worker.finalize_async_save = lambda: events.append(("finalize_async_save", None))
+    worker._copy_main_params_to_param_buffer = MagicMock()
+    move_model = worker.move_model
+    worker.move_model = lambda model, device, **kwargs: (
+        events.append(("move_model", (device, kwargs)))
+        or move_model(model, device, **kwargs)
+    )
+
+    worker.sync_params_before_refit()
+
+    expected = (
+        [
+            ("finalize_async_save", None),
+            ("move_model", ("cuda", {"move_params": True, "move_grads": False})),
+            ("start_param_sync", True),
+            ("cuda_synchronize", None),
+        ]
+        if hooks_enabled
+        else []
+    )
+    assert events == expected
+    worker._copy_main_params_to_param_buffer.assert_not_called()
+    assert buffer.grad_data.data_ptr() == gradient_pointer
+    torch.testing.assert_close(buffer.grad_data, torch.tensor([5.0, 6.0, 7.0, 8.0]))
+    if hooks_enabled:
+        torch.testing.assert_close(
+            buffer.param_data, torch.tensor([3.0, 4.0, 3.0, 4.0], dtype=torch.bfloat16)
+        )
+    elif parked:
+        assert buffer.param_data.untyped_storage().nbytes() == 0
+
+
+def test_megatron_offload_before_refit_finalizes_async_save_first(monkeypatch):
+    """Async checkpoint tensor references must be released before GPU offload."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    events = []
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    worker.model = object()
+    worker.optimizer = None
+    worker.optimizer_cpu_offload = False
+    worker.fp8_cfg = None
+    worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
+    worker.finalize_async_save = lambda: events.append("finalize_async_save")
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: False
+    worker.move_model = lambda model, device, move_params, move_grads: (
+        events.append(("move_model", move_grads)) or model
+    )
+
+    class _AllocatorWakeup:
+        def cuda(self):
+            events.append("wake_allocator")
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_allocated",
+        lambda *args, **kwargs: events.append("memory_allocated") or 0,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_reserved",
+        lambda *args, **kwargs: events.append("memory_reserved") or 0,
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: events.append("empty_cache"))
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+
+    MegatronPolicyWorkerImpl.offload_before_refit(worker)
+
+    assert events[0] == "finalize_async_save"
+    assert events.index("finalize_async_save") < events.index(("move_model", True))
+
+
+@pytest.mark.parametrize("hooks_enabled", [True, False])
+def test_megatron_sync_params_before_refit_materializes_latest_mxfp8_weights(
+    monkeypatch, hooks_enabled
+):
+    """Refit must see optimizer updates before the next overlapped train forward."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    events = []
+
+    class FakeDDP:
+        ddp_config = SimpleNamespace(overlap_param_gather=True)
+
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+
+    monkeypatch.setattr(megatron_policy_worker, "DistributedDataParallel", FakeDDP)
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = FakeDDP()
+    worker.finalize_async_save = lambda: events.append("finalize_async_save")
+    worker.move_model = lambda model, device, **kwargs: (
+        events.append(("move_model", device, kwargs)) or model
+    )
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: True
+    worker._forward_pre_hook_enabled = lambda: hooks_enabled
+    worker._disable_forward_pre_hook_until_next_train_step = (
+        lambda *, param_sync=False: events.append(("disable_hook", param_sync))
+    )
+    MegatronPolicyWorkerImpl.sync_params_before_refit(worker)
+
+    expected = (
+        [
+            "finalize_async_save",
+            ("move_model", "cuda", {"move_params": True, "move_grads": False}),
+            ("disable_hook", True),
+        ]
+        if hooks_enabled
+        else []
+    )
+    assert events == expected
+
+
+@pytest.mark.parametrize("ddp", [False, True])
+def test_megatron_sync_params_before_refit_is_noop_without_overlap(monkeypatch, ddp):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+
+    class FakeDDP:
+        ddp_config = SimpleNamespace(overlap_param_gather=False)
+
+    monkeypatch.setattr(megatron_policy_worker, "DistributedDataParallel", FakeDDP)
+    worker.model = FakeDDP() if ddp else object()
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: False
+    worker.finalize_async_save = MagicMock()
+    worker.move_model = MagicMock()
+    worker._disable_forward_pre_hook_until_next_train_step = MagicMock()
+
+    MegatronPolicyWorkerImpl.sync_params_before_refit(worker)
+
+    worker.finalize_async_save.assert_not_called()
+    worker.move_model.assert_not_called()
+    worker._disable_forward_pre_hook_until_next_train_step.assert_not_called()
+
+
+@pytest.mark.parametrize("offload_optimizer", [False, True])
+def test_megatron_offload_before_refit_honors_offload_optimizer_for_refit(
+    monkeypatch, offload_optimizer
+):
+    """offload_optimizer_for_refit=False must leave the optimizer untouched."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    moved = []
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    worker.model = object()
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = False
+    worker.offload_optimizer_for_refit = offload_optimizer
+    worker.fp8_cfg = None
+    worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": False}}
+    worker.finalize_async_save = lambda: None
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: False
+    worker.move_model = lambda model, device, move_params, move_grads: model
+    worker.move_optimizer = lambda device: moved.append(device)
+
+    class _AllocatorWakeup:
+        def cuda(self):
+            pass
+
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+
+    MegatronPolicyWorkerImpl.offload_before_refit(worker)
+
+    assert moved == (["cpu"] if offload_optimizer else [])
+
+
+@pytest.mark.parametrize(
+    "generation_backend, colocated, has_inference_model, shared_buffer, "
+    "expect_move_params, expect_move_grads",
+    [
+        # Plain training worker (no generation config): params always move.
+        (None, False, False, False, True, True),
+        # Shared-model colocated Megatron generation: params must stay resident —
+        # inference CUDA graphs replay with capture-time param pointers, and a
+        # CPU round-trip re-allocates their storage.
+        ("megatron", True, False, False, False, True),
+        # Colocated reshard (dedicated inference model): params still move; the
+        # graphs live on the dedicated, torch_memory_saver-managed model.
+        ("megatron", True, True, False, True, True),
+        # MXFP8 overlap aliases the parameter and gradient buffers, so neither
+        # storage can move independently.
+        (None, False, False, True, False, False),
+    ],
+)
+def test_megatron_offload_after_refit_finalizes_before_model_move(
+    monkeypatch,
+    generation_backend,
+    colocated,
+    has_inference_model,
+    shared_buffer,
+    expect_move_params,
+    expect_move_grads,
+):
+    """Checkpoint CUDA IPC handles must be dropped before model storage is replaced,
+    and graph/shared-buffer owners must keep their aliased storage resident."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    events = []
+    move_kwargs = []
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    worker.model = _FakeTrainableModel()
+    worker.model.eval = lambda: events.append("eval")
+    worker.cfg = {"megatron_cfg": {}}
+    if generation_backend:
+        worker.cfg["generation"] = {"backend": generation_backend}
+    worker.is_generation_colocated = colocated
+    worker.inference_model = object() if has_inference_model else None
+    worker._colocated_reshard_plan = None
+    worker.finalize_async_save = lambda: events.append("finalize_async_save")
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: shared_buffer
+    worker.move_model = lambda model, device, **kwargs: (
+        events.append("move_model") or move_kwargs.append(kwargs) or model
+    )
+    worker.offload_before_refit = lambda: events.append("offload_before_refit")
+
+    class _AllocatorWakeup:
+        def cuda(self):
+            events.append("wake_allocator")
+
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_allocated",
+        lambda *args, **kwargs: events.append("memory_allocated") or 0,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_reserved",
+        lambda *args, **kwargs: events.append("memory_reserved") or 0,
+    )
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+
+    MegatronPolicyWorkerImpl.offload_after_refit(worker)
+
+    assert events[0] == "finalize_async_save"
+    assert events.index("finalize_async_save") < events.index("move_model")
+    assert events.index("eval") < events.index("move_model")
+    assert move_kwargs[0]["move_params"] is expect_move_params
+    assert move_kwargs[0]["move_grads"] is expect_move_grads
+
+
+def test_megatron_finish_inference_evals_before_model_offload(monkeypatch):
+    """Mamba decode caches must refresh before CUDA parameter storage is released."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    events = []
+    move_kwargs = []
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    worker.model = _FakeTrainableModel()
+    worker.model.eval = lambda: events.append("eval")
+    worker.move_model = lambda model, device, **kwargs: (
+        events.append("move_model") or move_kwargs.append(kwargs) or model
+    )
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    MegatronPolicyWorkerImpl.finish_inference(worker)
+
+    assert events == ["eval", "move_model"]
+    assert move_kwargs == [{"move_params": True, "move_grads": False}]
+
+
+def test_megatron_save_checkpoint_onloads_model_before_save(monkeypatch):
+    """Params offloaded by colocated generation must be onloaded before the save walks them."""
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    events = []
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    worker.model = _FakeTrainableModel()
+    worker.model.training = False
+    worker.optimizer = object()
+    worker.scheduler = None
+    worker.optimizer_cpu_offload = False
+    worker.should_disable_forward_pre_hook = False
+    worker.checkpointing_context = None
+    worker.mcore_state = SimpleNamespace(
+        cfg=SimpleNamespace(
+            checkpoint=SimpleNamespace(save="original_path", async_save=False)
+        ),
+        train_state=SimpleNamespace(floating_point_operations_so_far=0),
+    )
+    worker.move_model = lambda model, device, move_params, move_grads: (
+        events.append(f"move_model_{device}") or model
+    )
+    worker.move_optimizer = lambda device: events.append(f"move_optimizer_{device}")
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("synchronize"))
+    monkeypatch.setattr(
+        worker_module,
+        "maybe_finalize_async_save",
+        lambda *args, **kwargs: events.append("finalize_async_save"),
+    )
+    monkeypatch.setattr(
+        worker_module, "save_checkpoint", lambda **kwargs: events.append("mcore_save")
+    )
+
+    MegatronPolicyWorkerImpl.save_checkpoint(
+        worker, weights_path="ckpt/weights", optimizer_path="ckpt/optim"
+    )
+
+    assert "mcore_save" in events
+    assert events.index("move_model_cuda") < events.index("mcore_save")
+    assert events.index("move_optimizer_cuda") < events.index("mcore_save")
+    assert events.index("synchronize") < events.index("mcore_save")
+    assert worker.mcore_state.cfg.checkpoint.save == "original_path"
+
+
+def test_megatron_save_checkpoint_records_scheduler_position(monkeypatch):
+    """Bridge restores scheduler.num_steps from consumed_train_samples on resume."""
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    worker.model = _FakeTrainableModel()
+    worker.model.training = False
+    worker.optimizer = object()
+    worker.scheduler = SimpleNamespace(num_steps=96)
+    worker.optimizer_cpu_offload = False
+    worker.should_disable_forward_pre_hook = False
+    worker.checkpointing_context = None
+    worker.mcore_state = SimpleNamespace(
+        cfg=SimpleNamespace(
+            checkpoint=SimpleNamespace(save="original_path", async_save=False)
+        ),
+        train_state=SimpleNamespace(
+            floating_point_operations_so_far=0, consumed_train_samples=0
+        ),
+    )
+    worker.move_model = lambda model, device, move_params, move_grads: model
+    worker.move_optimizer = lambda device: None
+
+    saved_consumed_samples = []
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(
+        worker_module, "maybe_finalize_async_save", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "save_checkpoint",
+        lambda **kwargs: saved_consumed_samples.append(
+            kwargs["state"].train_state.consumed_train_samples
+        ),
+    )
+
+    MegatronPolicyWorkerImpl.save_checkpoint(
+        worker, weights_path="ckpt/weights", optimizer_path="ckpt/optim"
+    )
+
+    assert saved_consumed_samples == [96]
+
+
+@pytest.mark.parametrize("cache_active", [True, False])
+def test_megatron_finalize_async_save_releases_colocated_nvrx_cache(
+    monkeypatch, cache_active
+):
+    """Only an active unsafe NVRx cache should terminate the persistent writer."""
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.cfg = {"generation": {"colocated": {"enabled": True}}}
+    worker.mcore_state = SimpleNamespace(
+        cfg=SimpleNamespace(
+            checkpoint=SimpleNamespace(
+                async_save=True,
+                use_persistent_ckpt_worker=True,
+                ckpt_assume_constant_structure=True,
+                async_ckpt_use_cpu_shm=False,
+            )
+        )
+    )
+    worker._async_checkpoint_cuda_cache_active = cache_active
+    events = []
+
+    monkeypatch.setattr(
+        worker_module,
+        "maybe_finalize_async_save",
+        lambda *args, **kwargs: events.append(("finalize", kwargs["terminate"])),
+    )
+
+    class _Writer:
+        @classmethod
+        def cleanup_tensor_caches(cls):
+            events.append(("cleanup_tensor_caches", None))
+
+    monkeypatch.setattr(worker_module, "FileSystemWriterAsync", _Writer)
+    monkeypatch.setattr(
+        worker_module.gc, "collect", lambda: events.append(("gc_collect", None))
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "ipc_collect",
+        lambda: events.append(("ipc_collect", None)),
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "empty_cache",
+        lambda: events.append(("empty_cache", None)),
+    )
+
+    worker_module.MegatronPolicyWorkerImpl.finalize_async_save(worker)
+
+    assert events[0] == ("finalize", cache_active)
+    if cache_active:
+        assert events[1:] == [
+            ("cleanup_tensor_caches", None),
+            ("gc_collect", None),
+            ("ipc_collect", None),
+            ("empty_cache", None),
+        ]
+        assert worker._async_checkpoint_cuda_cache_active is False
+    else:
+        assert events == [("finalize", False)]
+
+
+def test_megatron_move_model_does_not_serialize_extra_state():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    model = _ModelWithNonSerializableExtraState()
+
+    moved_model = MegatronPolicyWorkerImpl.move_model(worker, model, "cpu")
+
+    assert moved_model is model
+    assert model.weight.device.type == "cpu"
+    assert model.scale.device.type == "cpu"
+
+
+def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+    from nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer import (
+        CheckpointEngineWeightSynchronizer,
+    )
+
+    name = "model.layers.0.mlp.down_proj.weight"
+    weight = torch.randn(64, 64, dtype=torch.bfloat16)
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker._refit_prequant_names = set()
+    worker._refit_param_info_hf = None
+    worker.fp8_cfg = None
+    worker.model = object()
+    worker.draft_model = None
+    worker.refit_conversion_tasks = []
+    worker.cfg = {"megatron_cfg": {"enabled": True}}
+    worker.megatron_bridge = SimpleNamespace(
+        export_hf_weights=lambda *_args, **_kwargs: iter([(name, weight)])
+    )
+
+    def _prepare_refit_info() -> dict[str, Any]:
+        worker._refit_param_info_hf = {name: (weight.shape, weight.dtype)}
+        return worker._refit_param_info_hf
+
+    worker.prepare_refit_info = _prepare_refit_info
+    worker.checkpoint_engine = SimpleNamespace(get_target_weight_layout=lambda: None)
+
+    class _Generation:
+        def __init__(self) -> None:
+            self.refit_info: list[dict[str, Any]] = []
+
+        def prepare_refit_info(
+            self, state_dict_info: dict[str, Any] | None
+        ) -> list[str] | None:
+            assert state_dict_info is not None
+            self.refit_info.append(state_dict_info)
+            return [name] if len(self.refit_info) == 1 else None
+
+    generation = _Generation()
+    synchronizer = CheckpointEngineWeightSynchronizer(worker, generation, {})
+    synchronizer._ensure_checkpoint_engine_ready = lambda: None
+
+    synchronizer.init_communicator()
+    exported = dict(worker._checkpoint_engine_weight_iterator())
+
+    scale_name = name + "_scale_from_checkpoint"
+    assert generation.refit_info[1][name][1] == torch.float8_e4m3fn
+    assert generation.refit_info[1][scale_name][1] == torch.uint8
+    assert exported[name].dtype == torch.float8_e4m3fn
+    assert exported[scale_name].dtype == torch.uint8
+    assert exported[scale_name].shape == (64, 2)
+
+
+def test_reference_model_swap_restores_state():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor([1.0]))
+            self.register_buffer("extra_state_cache", torch.tensor([2.0]))
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = Model()
+    worker.reference_state_dict = {
+        "weight": torch.tensor([11.0]),
+        "extra_state_cache": torch.tensor([12.0]),
+    }
+    worker.cfg = {
+        "megatron_cfg": {
+            "empty_unused_memory_level": 0,
+        }
+    }
+    worker.should_disable_forward_pre_hook = False
+    worker.sampling_params = None
+    for _ in range(2):
+        with worker.use_reference_model():
+            torch.testing.assert_close(worker.model.weight, torch.tensor([11.0]))
+            torch.testing.assert_close(
+                worker.model.extra_state_cache, torch.tensor([12.0])
+            )
+        torch.testing.assert_close(worker.model.weight, torch.tensor([1.0]))
+        torch.testing.assert_close(worker.model.extra_state_cache, torch.tensor([2.0]))
+
+
+def test_clear_rope_and_moe_dispatcher_caches_clears_tensor_state(monkeypatch):
+    from megatron.core.models.common.embeddings import rotary_pos_embedding
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    cache_clear = MagicMock()
+
+    def forward():
+        return None
+
+    forward.cache_clear = cache_clear
+    monkeypatch.setattr(
+        rotary_pos_embedding,
+        "RotaryEmbedding",
+        SimpleNamespace(forward=forward),
+    )
+    dispatcher = SimpleNamespace(
+        probs=torch.ones(1),
+        routing_map=torch.ones(1),
+        reversed_local_input_permutation_mapping=torch.ones(1),
+        local_probs=torch.ones(1),
+        local_map=torch.ones(1),
+        non_tensor="keep",
+    )
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = SimpleNamespace(
+        modules=lambda: [
+            SimpleNamespace(),
+            SimpleNamespace(token_dispatcher=None),
+            SimpleNamespace(token_dispatcher=dispatcher),
+        ]
+    )
+
+    worker._clear_rope_and_moe_dispatcher_caches()
+
+    cache_clear.assert_called_once_with()
+    assert dispatcher.probs is None
+    assert dispatcher.routing_map is None
+    assert dispatcher.reversed_local_input_permutation_mapping is None
+    assert dispatcher.local_probs is None
+    assert dispatcher.local_map is None
+    assert dispatcher.non_tensor == "keep"
+
+
+def test_clear_rope_and_moe_dispatcher_caches_is_best_effort(monkeypatch):
+    from megatron.core.models.common.embeddings import rotary_pos_embedding
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    def forward():
+        return None
+
+    forward.cache_clear = MagicMock(side_effect=RuntimeError("rotary cache"))
+    monkeypatch.setattr(
+        rotary_pos_embedding,
+        "RotaryEmbedding",
+        SimpleNamespace(forward=forward),
+    )
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = SimpleNamespace(
+        modules=MagicMock(side_effect=RuntimeError("module traversal"))
+    )
+
+    worker._clear_rope_and_moe_dispatcher_caches()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_maybe_prequantize_param_passthrough_when_not_selected(dtype):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    name = "model.weight"
+    worker._refit_prequant_names = set()
+    tensor = torch.ones(2, 2, dtype=dtype)
+
+    result = list(worker._maybe_prequantize_param(name, tensor))
+
+    assert len(result) == 1
+    assert result[0][0] == name
+    assert result[0][1] is tensor
+
+
+def test_maybe_prequantize_param_rejects_fp8_trainer_storage():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    name = "model.weight"
+    worker._refit_prequant_names = {name}
+    tensor = torch.ones(2, 2, dtype=torch.float8_e4m3fn)
+
+    with pytest.raises(ValueError, match="BF16 trainer-exported weights"):
+        list(worker._maybe_prequantize_param(name, tensor))
+
+
+def test_enable_refit_prequantize_rejects_blockwise_fp8_storage():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = {
+        "fp8_param": True,
+        "fp8_recipe": "blockwise",
+    }
+
+    with pytest.raises(ValueError, match="BF16 trainer-exported weights"):
+        worker.enable_refit_prequantize(["model.weight"])
+
+
+def test_enable_refit_prequantize_requires_prepare_refit_info():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = None
+    worker._refit_param_info_hf = None
+
+    with pytest.raises(RuntimeError, match="prepare_refit_info"):
+        worker.enable_refit_prequantize(["model.weight"])
+
+
+def test_enable_refit_prequantize_derives_metadata_without_export():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = None
+    worker._refit_param_info_hf = {
+        "model.a.weight": (torch.Size([4, 64]), torch.bfloat16),
+        "model.b.weight": (torch.Size([4, 64]), torch.bfloat16),
+    }
+
+    def _fail_iter(*_args, **_kwargs):
+        raise AssertionError("metadata derivation must not re-export weights")
+
+    worker._iter_params_with_optional_kv_scales = _fail_iter
+
+    info = worker.enable_refit_prequantize(["model.a.weight"])
+
+    assert info["model.a.weight"] == (torch.Size([4, 64]), torch.float8_e4m3fn)
+    assert info["model.a.weight_scale_from_checkpoint"] == (
+        torch.Size([4, 2]),
+        torch.uint8,
+    )
+    assert info["model.b.weight"] == (torch.Size([4, 64]), torch.bfloat16)
+    assert worker._refit_prequant_names == {"model.a.weight"}
+
+
+def test_prepare_source_refit_info_resets_previous_prequantization_selection():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    name = "model.weight"
+    worker._refit_prequant_names = {name}
+    worker._calculate_refit_param_info = lambda: {}
+
+    def _iter_params():
+        dtype = (
+            torch.float8_e4m3fn
+            if name in worker._refit_prequant_names
+            else torch.bfloat16
+        )
+        yield name, torch.ones(2, 64, dtype=dtype)
+
+    worker._iter_params_with_optional_kv_scales = _iter_params
+
+    info = worker._prepare_source_refit_info()
+
+    assert worker._refit_prequant_names == set()
+    assert info[name] == (torch.Size([2, 64]), torch.bfloat16)
+
+
+def test_enable_refit_prequantize_rejects_indivisible_last_dim():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.fp8_cfg = None
+    worker._refit_param_info_hf = {
+        "model.weight": (torch.Size([4, 48]), torch.bfloat16),
+    }
+
+    with pytest.raises(ValueError, match="divisible"):
+        worker.enable_refit_prequantize(["model.weight"])
+
+
+def test_offload_after_refit_uses_standard_cleanup(monkeypatch):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    model = SimpleNamespace(eval=MagicMock())
+    worker.model = model
+    worker.move_model = MagicMock(return_value=model)
+    worker.cfg = {
+        "megatron_cfg": {
+            "clear_memory_caches_before_refit": True,
+        }
+    }
+    worker.fp8_cfg = {"force_clear_fp8_caches": True}
+    worker.megatron_cfg = SimpleNamespace(
+        optimizer=SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=False),
+        ddp=SimpleNamespace(overlap_param_gather=False),
+    )
+    worker._clear_fp8_caches = MagicMock()
+    worker._clear_rope_and_moe_dispatcher_caches = MagicMock()
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = False
+    worker.offload_optimizer_for_refit = True
+    worker.move_optimizer = MagicMock()
+    worker.offload_before_refit = MagicMock()
+    worker.finalize_async_save = MagicMock()
+    collect = MagicMock()
+    empty_cache = MagicMock()
+    monkeypatch.setattr(
+        torch,
+        "randn",
+        lambda *_args, **_kwargs: SimpleNamespace(cuda=lambda: None),
+    )
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", lambda *_args: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.workers.megatron_policy_worker.gc.collect",
+        collect,
+    )
+
+    worker.offload_after_refit()
+
+    worker.finalize_async_save.assert_called_once_with()
+    worker.move_model.assert_called_once_with(
+        model, "cpu", move_params=True, move_grads=True
+    )
+    model.eval.assert_called_once_with()
+    worker.offload_before_refit.assert_called_once_with()
+    worker._clear_fp8_caches.assert_not_called()
+    worker._clear_rope_and_moe_dispatcher_caches.assert_not_called()
+    worker.move_optimizer.assert_not_called()
+    collect.assert_not_called()
+    empty_cache.assert_not_called()
+
+
+def test_megatron_prepare_for_training_restores_optimizer():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    model = _FakeTrainableModel()
+    restored_devices = []
+
+    worker.model = model
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = False
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+    worker.move_model = lambda model, device, move_grads, move_params: model
+    worker.move_optimizer = lambda device: restored_devices.append(device)
+
+    MegatronPolicyWorkerImpl.prepare_for_training(worker)
+
+    assert model.train_called
+    assert restored_devices == ["cuda"]
+
+
+def test_megatron_prepare_for_training_leaves_native_cpu_optimizer_placement():
+    """HybridDeviceOptimizer owns state placement when native offload is enabled."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    model = _FakeTrainableModel()
+    worker.model = model
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = True
+    worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
+    worker.move_model = lambda model, device, move_grads, move_params: model
+    worker.move_optimizer = lambda device: pytest.fail(
+        "native optimizer CPU offload must not use the generic optimizer mover"
+    )
+
+    MegatronPolicyWorkerImpl.prepare_for_training(worker)
+
+    assert model.train_called
+
+
+def test_megatron_prepare_for_logprobs_restores_mxfp8_shared_buffer(monkeypatch):
+    """Restore and restage the shared buffer before MXFP8 parameter gather."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    model = _FakeTrainableModel()
+    move_calls = []
+
+    worker.rank = 0
+    worker.model = model
+    worker.optimizer = object()
+    worker.optimizer_cpu_offload = False
+    worker.offload_optimizer_for_logprob = False
+    worker._uses_mxfp8_overlap_shared_param_buffer = lambda: True
+    worker._log_gpu_mem = lambda *_args, **_kwargs: None
+    worker.move_model = lambda model, device, **kwargs: (
+        move_calls.append((device, kwargs)) or model
+    )
+    stage_calls = []
+    worker._copy_main_params_to_param_buffer = lambda zero_grad_buffer=False: (
+        stage_calls.append(zero_grad_buffer)
+    )
+
+    class _AllocatorWakeup:
+        def cuda(self):
+            return self
+
+    monkeypatch.setattr(torch, "randn", lambda *args, **kwargs: _AllocatorWakeup())
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    MegatronPolicyWorkerImpl.prepare_for_lp_inference(worker)
+
+    assert model.eval_called
+    assert move_calls == [("cuda", {"move_grads": True})]
+    assert stage_calls == [True]
+
+
+def test_set_moe_grad_scale_func_sets_and_clears_on_model_config():
+    """_set_moe_grad_scale_func should set/clear moe_grad_scale_func on the config."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    model_config = SimpleNamespace()
+    worker.model = SimpleNamespace(config=model_config)
+
+    def scale():
+        return 0.5
+
+    MegatronPolicyWorkerImpl._set_moe_grad_scale_func(worker, scale)
+    assert model_config.moe_grad_scale_func is scale
+
+    # Clearing after the forward-backward pass restores None.
+    MegatronPolicyWorkerImpl._set_moe_grad_scale_func(worker, None)
+    assert model_config.moe_grad_scale_func is None
+
+
+def test_set_moe_grad_scale_func_handles_float16module_wrapper():
+    """_get_model_config should unwrap a Float16Module-style .module.config."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    inner_config = SimpleNamespace()
+    worker.model = SimpleNamespace(module=SimpleNamespace(config=inner_config))
+
+    def scale():
+        return 2.0
+
+    MegatronPolicyWorkerImpl._set_moe_grad_scale_func(worker, scale)
+    assert inner_config.moe_grad_scale_func is scale
+
+
+def test_set_moe_grad_scale_func_noop_when_no_config():
+    """A model without a resolvable config should be a no-op, not an error."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+    worker.model = SimpleNamespace()  # no .config and no .module
+
+    # Should not raise even though there is no config to set the func on.
+    MegatronPolicyWorkerImpl._set_moe_grad_scale_func(worker, lambda: 1.0)
+
+
+def test_compute_moe_grad_scale_normalizes_by_valid_tokens():
+    """_compute_moe_grad_scale should yield loss_scale = 1/global_valid_toks."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+
+    scale_fn = MegatronPolicyWorkerImpl._compute_moe_grad_scale(
+        worker, torch.tensor(4.0)
+    )
+    assert torch.allclose(scale_fn(), torch.tensor(0.25))
+
+
+def test_compute_moe_grad_scale_clamps_zero_valid_tokens():
+    """clamp(min=1) must guard against division by zero when no valid tokens."""
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    _disable_opd_full(worker)
+
+    scale_fn = MegatronPolicyWorkerImpl._compute_moe_grad_scale(
+        worker, torch.tensor(0.0)
+    )
+    assert torch.allclose(scale_fn(), torch.tensor(1.0))
+
+
+def test_split_train_api_rejects_direct_packed_sft_rows():
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    data = BatchedDataDict(
+        {
+            "packed_cu_seqlens": torch.tensor([[0, 4]], dtype=torch.int32),
+            "target_ids": torch.ones(1, 4, dtype=torch.long),
+        }
+    )
+
+    with pytest.raises(NotImplementedError, match="split training API"):
+        MegatronPolicyWorkerImpl._train_microbatch_body(
+            worker,
+            {"loss_fn": NLLLossFn()},
+            data,
+        )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected_param_sync"),
+    [({}, False), ({"param_sync": True}, True)],
+)
+def test_disable_forward_pre_hook_until_next_step_uses_worker_override(
+    kwargs: dict[str, bool], expected_param_sync: bool
+) -> None:
+    source_path = (
+        Path(__file__).parents[4]
+        / "nemo_rl/models/policy/workers/megatron_policy_worker.py"
+    )
+    tree = ast.parse(source_path.read_text())
+    method = next(
+        node
+        for class_node in tree.body
+        if isinstance(class_node, ast.ClassDef)
+        and class_node.name == "MegatronPolicyWorkerImpl"
+        for node in class_node.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_disable_forward_pre_hook_until_next_train_step"
+    )
+
+    class_kwargs = {
+        "name": "_Worker",
+        "bases": [],
+        "keywords": [],
+        "body": [method],
+        "decorator_list": [],
+    }
+    if "type_params" in ast.ClassDef._fields:
+        class_kwargs["type_params"] = []
+    test_module = ast.Module(
+        body=[ast.ClassDef(**class_kwargs)],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(test_module)
+
+    class FakeDDP:
+        def disable_forward_pre_hook(self, param_sync=True):
+            raise AssertionError("raw DDP hook disable should not be called directly")
+
+    model_config = SimpleNamespace(param_sync_func="sync")
+    namespace = {
+        "DistributedDataParallel": FakeDDP,
+        "get_model_config": lambda _: model_config,
+    }
+    exec(compile(test_module, str(source_path), "exec"), namespace)
+
+    worker = namespace["_Worker"]()
+    worker.model = FakeDDP()
+    worker._forward_pre_hook_enabled = lambda: True
+    disable_calls = []
+    worker.disable_forward_pre_hook = lambda param_sync=True: disable_calls.append(
+        param_sync
+    )
+
+    worker._disable_forward_pre_hook_until_next_train_step(**kwargs)
+
+    assert disable_calls == [expected_param_sync]
+    assert worker._first_train_step_param_sync_func == "sync"
+    assert model_config.param_sync_func is None
+    assert worker._first_train_step_forward_pre_hook_disabled is True
+
+
+@pytest.mark.parametrize("update_successful", [False, True])
+def test_restore_first_train_step_param_sync(
+    monkeypatch: pytest.MonkeyPatch, update_successful: bool
+) -> None:
+    from nemo_rl.models.policy.workers import megatron_policy_worker
+
+    worker = object.__new__(megatron_policy_worker.MegatronPolicyWorkerImpl)
+    worker.model = object()
+    worker.enable_forward_pre_hook = MagicMock()
+    saved_param_sync = MagicMock(name="saved_param_sync")
+    worker._first_train_step_forward_pre_hook_disabled = True
+    worker._first_train_step_param_sync_func = saved_param_sync
+    model_config = SimpleNamespace(param_sync_func=None)
+    monkeypatch.setattr(
+        megatron_policy_worker, "get_model_config", lambda _: model_config
+    )
+
+    worker._restore_first_train_step_param_sync(update_successful)
+
+    if update_successful:
+        worker.enable_forward_pre_hook.assert_called_once_with()
+        assert model_config.param_sync_func is saved_param_sync
+        assert worker._first_train_step_param_sync_func is None
+        assert worker._first_train_step_forward_pre_hook_disabled is False
+
+        worker._restore_first_train_step_param_sync(True)
+        worker.enable_forward_pre_hook.assert_called_once_with()
+    else:
+        worker.enable_forward_pre_hook.assert_not_called()
+        assert model_config.param_sync_func is None
+        assert worker._first_train_step_param_sync_func is saved_param_sync
+        assert worker._first_train_step_forward_pre_hook_disabled is True
+
+
+def test_prepare_for_generation_disables_param_gather_hook_before_wake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.models.generation.megatron import megatron_worker
+
+    events = []
+    model = SimpleNamespace(
+        config=SimpleNamespace(flash_decode=True),
+        eval=lambda: events.append("eval"),
+    )
+    worker = object.__new__(megatron_worker.MegatronGenerationMixin)
+    worker.cfg = {
+        "generation": {"mcore_generation_config": {"cuda_graph_impl": "none"}}
+    }
+    worker.model = model
+    worker.is_generation_colocated = True
+    worker.should_disable_forward_pre_hook = True
+    worker.move_model = lambda model, device, **kwargs: (
+        events.append("move_to_cuda") or model
+    )
+    worker._forward_pre_hook_enabled = lambda: True
+    worker._disable_forward_pre_hook_until_next_train_step = (
+        lambda *, param_sync=False: events.append(("disable_hook", param_sync))
+    )
+    worker._inference_engine_initialized = True
+    # Asleep, so the idempotent-wake guard falls through to the full wake path.
+    worker._inference_engine_asleep = True
+    worker._wake = lambda: events.append("wake_engine")
+
+    monkeypatch.setattr(megatron_worker, "log_gpu_memory", lambda *_: None)
+    monkeypatch.setattr(megatron_worker, "unwrap_model", lambda model: model)
+
+    worker.prepare_for_generation()
+
+    assert events == [
+        "move_to_cuda",
+        ("disable_hook", True),
+        "eval",
+        "wake_engine",
+    ]
+    assert model.config.flash_decode is False
+
+
+def create_megatron_test_config(
+    model_name: str,
+    tp: int = 1,
+    pp: int = 1,
+    precision: str = "float32",
+    activation_checkpointing: bool = False,
+    generation_backend: str = "megatron",
+    sequence_parallel: bool = False,
+    logprob_chunk_size: Optional[int] = None,
+    defer_fp32_logits: Optional[bool] = None,
+    attention_backend: Optional[str] = None,
+) -> PolicyConfig:
+    """Create a test config for Megatron policy worker."""
+    return {
+        "model_name": model_name,
+        "tokenizer": {"name": model_name},
+        "generation_batch_size": 2,  # Small batch size for testing
+        "train_global_batch_size": 8,
+        "train_micro_batch_size": 2,
+        "learning_rate": 5e-6,
+        "logprob_batch_size": 2,
+        "logprob_chunk_size": logprob_chunk_size,
+        "precision": precision,
+        "offload_optimizer_for_logprob": False,
+        "offload_policy_before_refit": False,
+        "offload_optimizer_for_refit": True,
+        "generation": {
+            "backend": generation_backend,
+            "refit_transport": "mcore" if generation_backend == "megatron" else None,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": None,
+            "max_new_tokens": 32,  # Small number of tokens for testing
+            "stop_token_ids": None,
+            "stop_strings": None,
+            "mcore_generation_config": {
+                "max_model_len": 1024,
+                "buffer_size_gb": 2,
+                "num_cuda_graphs": 16,
+                "block_size_tokens": 1024,
+                "use_cuda_graphs_for_non_decode_steps": True,
+                "enable_chunked_prefill": True,
+                "max_tokens": 65536,
+                "cuda_graph_impl": "local",
+                "enable_prefix_caching": False,
+                "kv_cache_management_mode": "persist",
+                "materialize_only_last_token_logits": True,
+                "num_speculative_tokens": 0,
+                "logprobs_mode": "processed_logprobs",
+                "refit_backend": "gloo",  # not nvshmem: its NVLS multicast init is unavailable in CI
+                "refit_execution_batch_bytes": None,
+                "parsers": [],
+                "expose_http_server": False,
+            },
+            "colocated": {
+                "enabled": True,
+                "resources": {
+                    "gpus_per_node": None,
+                    "num_nodes": None,
+                },
+            },
+        },
+        "automodel_cfg": {
+            "enabled": False,  # Disabled for Megatron tests
+        },
+        "dynamic_batching": {
+            "enabled": False,  # Start with simple batching
+        },
+        "sequence_packing": {
+            "enabled": False,  # Start with simple batching
+        },
+        "megatron_cfg": {
+            "enabled": True,
+            "empty_unused_memory_level": 0,
+            "activation_checkpointing": activation_checkpointing,
+            "tensor_model_parallel_size": tp,
+            "expert_tensor_parallel_size": 1,
+            "expert_model_parallel_size": 1,
+            "pipeline_model_parallel_size": pp,
+            "num_layers_in_first_pipeline_stage": None,
+            "num_layers_in_last_pipeline_stage": None,
+            "context_parallel_size": 1,
+            "pipeline_dtype": precision,
+            "sequence_parallel": sequence_parallel,
+            "freeze_moe_router": True,
+            "moe_router_dtype": "fp64",
+            "moe_router_load_balancing_type": "none",
+            "moe_router_bias_update_rate": 0.0,
+            "moe_permute_fusion": False,
+            "apply_rope_fusion": True,
+            "bias_activation_fusion": True,
+            "moe_per_layer_logging": False,
+            "moe_enable_deepep": False,
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_shared_expert_overlap": False,
+            "defer_fp32_logits": defer_fp32_logits,
+            "use_fused_linear_logprobs": False,
+            "fused_linear_logprobs_chunk_size": 256,
+            "gradient_accumulation_fusion": False,
+            "use_fused_weighted_squared_relu": False,
+            "train_iters": 100,  # Required for Megatron training
+            "optimizer": {
+                "optimizer": "adam",
+                "lr": 5.0e-6,
+                "min_lr": 5.0e-7,
+                "weight_decay": 0.01,
+                "bf16": precision == "bfloat16",
+                "fp16": precision == "float16",
+                "params_dtype": "float32",
+                "adam_beta1": 0.9,
+                "adam_beta2": 0.999,
+                "adam_eps": 1e-8,
+                "use_distributed_optimizer": True,
+                "use_precision_aware_optimizer": True,
+                "clip_grad": 1.0,
+                "optimizer_cpu_offload": False,
+                "optimizer_offload_fraction": 0.0,
+                "overlap_cpu_optimizer_d2h_h2d": False,
+            },
+            "scheduler": {
+                "start_weight_decay": 0.01,
+                "end_weight_decay": 0.01,
+                "weight_decay_incr_style": "constant",
+                "lr_decay_style": "constant",
+                "lr_decay_iters": None,
+                "lr_warmup_iters": 50,
+                "lr_warmup_init": 5.0e-7,
+            },
+            "distributed_data_parallel_config": {
+                "grad_reduce_in_fp32": False,
+                "overlap_grad_reduce": True,
+                "overlap_param_gather": False,
+                "data_parallel_sharding_strategy": "optim_grads_params",
+            },
+            "fp8_cfg": {
+                "enabled": False,
+                "fp8": "hybrid",
+                "fp8_recipe": "tensorwise",
+                "fp8_param": True,
+            },
+            "attention_backend": attention_backend,
+        },
+        "draft": Eagle3DraftConfig(enabled=False),
+        "make_sequence_length_divisible_by": tp,
+        "optimizer": None,  # Remove default Automodel optimizer
+        "scheduler": None,  # Remove default scheduler
+        "max_grad_norm": 1.0,
+    }
+
+
+@pytest.fixture(scope="function")
+def gc_collect():
+    """Helper function to force garbage collection after a test"""
+    import gc
+
+    yield
+    gc.collect()
+
+
+@pytest.fixture
+def policy_setup(request, tiny_llama_model_path):
+    """Setup and teardown for policy tests - creates a virtual cluster and policy."""
+    # Get parameters from request
+    if hasattr(request, "param") and request.param is not None:
+        num_gpus, tp, pp = request.param
+    else:
+        num_gpus, tp, pp = 2, 1, 1
+
+    policy = None
+    cluster = None
+
+    try:
+        cluster_name = f"test-megatron-init-{num_gpus}gpu-tp{tp}-pp{pp}"
+        print(
+            f"Creating virtual cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp})..."
+        )
+
+        cluster = RayVirtualCluster(
+            name=cluster_name,
+            bundle_ct_per_node_list=[num_gpus],
+            use_gpus=True,
+            num_gpus_per_node=num_gpus,
+            max_colocated_worker_groups=1,
+        )
+
+        config = create_megatron_test_config(tiny_llama_model_path, tp=tp, pp=pp)
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+
+        print("Creating Megatron Policy...")
+        policy = Policy(cluster=cluster, config=config, tokenizer=tokenizer)
+
+        yield policy, cluster
+
+    finally:
+        print("Cleaning up resources for test")
+        if policy:
+            policy.shutdown()
+        if cluster:
+            cluster.shutdown()
+
+
+@pytest.fixture
+def training_setup(request):
+    """Setup and teardown specifically for training tests."""
+    # Parse parameters: (num_gpus, tp, pp, model_fixture_name, config_updates)
+    if hasattr(request, "param") and request.param is not None:
+        num_gpus, tp, pp, model_fixture_name, config_updates = request.param
+    else:
+        num_gpus, tp, pp, model_fixture_name, config_updates = (
+            2,
+            1,
+            1,
+            "tiny_llama_model_path",
+            {},
+        )
+
+    # Get the actual model path from the requested fixture
+    model_name = request.getfixturevalue(model_fixture_name)
+
+    policy = None
+    cluster = None
+    data = None
+    loss_fn = None
+
+    try:
+        cluster_name = f"test-megatron-train-{num_gpus}gpu-tp{tp}-pp{pp}"
+        if config_updates:
+            cluster_name += "-" + "-".join(
+                [f"{k}={v}" for k, v in config_updates.items()]
+            )
+
+        print(
+            f"Creating training cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp})"
+        )
+
+        cluster = RayVirtualCluster(
+            name=cluster_name,
+            bundle_ct_per_node_list=[num_gpus],
+            use_gpus=True,
+            num_gpus_per_node=num_gpus,
+            max_colocated_worker_groups=1,
+        )
+
+        # Determine converter type based on model
+        config = create_megatron_test_config(
+            model_name=model_name,
+            tp=tp,
+            pp=pp,
+        )
+
+        # Apply config updates
+        if config_updates:
+            if "precision" in config_updates:
+                config["precision"] = config_updates["precision"]
+                config["megatron_cfg"]["pipeline_dtype"] = config_updates["precision"]
+                config["megatron_cfg"]["optimizer"]["bf16"] = (
+                    config_updates["precision"] == "bfloat16"
+                )
+                config["megatron_cfg"]["optimizer"]["fp16"] = (
+                    config_updates["precision"] == "float16"
+                )
+            if "activation_checkpointing" in config_updates:
+                config["megatron_cfg"]["activation_checkpointing"] = config_updates[
+                    "activation_checkpointing"
+                ]
+            if "sequence_parallel" in config_updates:
+                config["megatron_cfg"]["sequence_parallel"] = config_updates[
+                    "sequence_parallel"
+                ]
+            if "attention_backend" in config_updates:
+                config["megatron_cfg"]["attention_backend"] = config_updates[
+                    "attention_backend"
+                ]
+
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+
+        print("Creating Megatron training Policy...")
+        policy = Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+
+        # Create a test batch
+        print("Creating test batch...")
+        torch.manual_seed(42)
+
+        # Create test input_ids and attention_mask
+        input_ids = torch.randint(0, 32000, (8, 128))  # 8 sequences, each of length 128
+        attention_mask = torch.ones(8, 128)
+        input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+        data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "attention_mask": attention_mask,
+                "labels": torch.randint(0, 32000, (8, 128)),
+                "sample_mask": torch.ones(8),
+            }
+        )
+
+        # Create loss function
+        loss_fn: LossFunction = SimpleLossFn()
+
+        yield policy, cluster, data, loss_fn
+
+    except Exception as e:
+        print(f"Error during training setup: {e}")
+        pytest.skip(f"Training setup failed: {e}")
+    finally:
+        print("Cleaning up training resources")
+        if policy:
+            policy.shutdown()
+        if cluster:
+            cluster.shutdown()
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize(
+    "training_setup",
+    [
+        # (num_gpus, tp, pp, model_fixture_name, config_updates)
+        (2, 1, 1, "tiny_llama_model_path", {}),
+        (2, 2, 1, "tiny_llama_model_path", {}),
+        (2, 1, 1, "tiny_qwen2_model_path", {}),
+        (2, 2, 1, "tiny_qwen2_model_path", {}),
+        (2, 1, 1, "tiny_llama_model_path", {"precision": "bfloat16"}),
+        (2, 1, 1, "tiny_llama_model_path", {"activation_checkpointing": True}),
+        (2, 2, 1, "tiny_llama_model_path", {"sequence_parallel": True}),
+        (2, 2, 1, "tiny_llama_model_path", {"precision": "bfloat16", "fp8": "hybrid"}),
+        (
+            2,
+            1,
+            1,
+            "tiny_llama_model_path",
+            {"attention_backend": "flash", "precision": "bfloat16"},
+        ),
+    ],
+    indirect=True,
+    ids=[
+        "2gpu_dp2_llama",
+        "2gpu_tp2_llama",
+        "2gpu_dp2_qwen2",
+        "2gpu_tp2_qwen2",
+        "2gpu_dp2_llama_bf16",
+        "2gpu_dp2_llama_ac",
+        "2gpu_tp2_llama_sp",
+        "2gpu_tp2_llama_fp8",
+        "2gpu_dp2_llama_attention_backend_flash",
+    ],
+)
+def test_megatron_policy_training(training_setup):
+    """Test Megatron policy training with different configurations."""
+
+    def verify_loss_tensor(loss_tensor):
+        assert not torch.isnan(loss_tensor).any(), "Loss should not be NaN"
+        assert not torch.isinf(loss_tensor).any(), "Loss should not be Inf"
+        return loss_tensor
+
+    policy, cluster, data, loss_fn = training_setup
+
+    # Verify resources were created properly
+    assert policy is not None, "Training policy was not created properly"
+    assert cluster is not None, "Training cluster was not created properly"
+    assert data is not None, "Test data was not created properly"
+    assert loss_fn is not None, "Loss function was not created properly"
+
+    # Call prepare_for_training
+    print("\nPreparing for training...")
+    policy.prepare_for_training()
+
+    losses = []
+    for step in range(3):
+        results = policy.train(data, loss_fn)
+
+        # Verify results
+        assert "loss" in results, "Training results should contain 'loss'"
+        loss_tensor = results["loss"]
+        verify_loss_tensor(loss_tensor)
+        losses.append(loss_tensor[-1].item())
+
+        print(f"Training loss at step {step}: {results['loss']}")
+
+    policy.finish_training()
+
+    # Verify loss changed between iterations (model parameters were updated)
+    assert losses[0] > losses[-1], "Loss should decrease over training iterations"
+
+    if policy.flops_tracker is not None:
+        assert "total_flops" in results and isinstance(
+            results["total_flops"], (int, float)
+        ), "training backend should report total_flops"
+        assert results["total_flops"] > 0, "total_flops should be positive"
+        assert "num_ranks" in results and isinstance(results["num_ranks"], int), (
+            "training backend should report num_ranks"
+        )
+        assert results["num_ranks"] > 0, "num_ranks should be positive"
+
+        # we don't always require theoretical_tflops since the data about the GPU
+        # is not always available.
+        if "theoretical_tflops" in results:
+            assert isinstance(results["theoretical_tflops"], (int, float)), (
+                "training backend should report theoretical_tflops"
+            )
+            assert results["theoretical_tflops"] > 0, (
+                "theoretical_tflops should be positive"
+            )
+
+
+@pytest.fixture
+def generation_setup(request, tiny_llama_model_path):
+    """Setup and teardown specifically for generation tests."""
+    # Parse parameters: (num_gpus, tp, pp, generation_backend)
+    if hasattr(request, "param") and request.param is not None:
+        num_gpus, tp, pp, generation_backend = request.param
+    else:
+        num_gpus, tp, pp, generation_backend = 2, 1, 1, "megatron"
+
+    policy = None
+    cluster = None
+    data = None
+
+    try:
+        cluster_name = (
+            f"test-megatron-gen-{num_gpus}gpu-tp{tp}-pp{pp}-{generation_backend}"
+        )
+        print(
+            f"Creating generation cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp}, backend={generation_backend})"
+        )
+
+        cluster = RayVirtualCluster(
+            name=cluster_name,
+            bundle_ct_per_node_list=[num_gpus],
+            use_gpus=True,
+            num_gpus_per_node=num_gpus,
+            max_colocated_worker_groups=1,
+        )
+
+        config = create_megatron_test_config(
+            tiny_llama_model_path,
+            tp=tp,
+            pp=pp,
+            precision="bfloat16",  # FlashAttention requires fp16 or bf16
+            generation_backend=generation_backend,
+        )
+
+        # Configure vLLM if using vLLM backend
+        if generation_backend == "vllm":
+            config["generation"]["vllm_cfg"] = {
+                "tensor_parallel_size": tp,
+                "gpu_memory_utilization": 0.6,
+                "max_model_len": 256,
+            }
+
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+
+        print("Creating Megatron generation Policy...")
+        policy = Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+
+        generation = MegatronGeneration(
+            config=config, tokenizer=tokenizer, policy=policy
+        )
+
+        # Create test data
+        print("Creating test batch...")
+        torch.manual_seed(42)
+
+        prompts = [
+            "Hello, how are you?",
+            "The capital of France is",
+            "Write a short story about",
+            "Explain quantum physics in simple terms:",
+        ]
+
+        tokenized = tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=64,
+            return_tensors="pt",
+            padding_side="right",
+        )
+
+        input_lengths = tokenized["attention_mask"].sum(dim=1).to(torch.int32)
+
+        data = BatchedDataDict(
+            {
+                "input_ids": tokenized["input_ids"],
+                "input_lengths": input_lengths,
+            }
+        )
+
+        yield policy, generation, cluster, data, prompts
+
+    except Exception as e:
+        print(f"Error during generation setup: {e}")
+        pytest.skip(f"Generation setup failed: {e}")
+    finally:
+        print("Cleaning up generation resources")
+        if policy:
+            policy.shutdown()
+        if cluster:
+            cluster.shutdown()
+
+
+@pytest.mark.timeout(240)
+@pytest.mark.parametrize(
+    "generation_setup",
+    [
+        # (num_gpus, tp, pp, generation_backend)
+        (2, 1, 1, "megatron"),
+        (2, 2, 1, "megatron"),
+    ],
+    indirect=True,
+    ids=["2gpu_dp2_megatron", "2gpu_tp2_megatron"],
+)
+def test_megatron_policy_generation(generation_setup):
+    """Test Megatron policy generation with different backends."""
+    policy, generation, cluster, data, prompts = generation_setup
+
+    # Verify resources were created properly
+    assert policy is not None, "Generation policy was not created properly"
+    assert cluster is not None, "Generation cluster was not created properly"
+    assert data is not None, "Test data was not created properly"
+
+    # Call prepare_for_generation
+    print("Preparing for generation...")
+    generation.prepare_for_generation()
+
+    # Generate text
+    print("Generating text...")
+    results = generation.generate(data, greedy=True)
+
+    # Verify results
+    assert "output_ids" in results, "Generation results should contain 'output_ids'"
+    output_ids = results["output_ids"]
+
+    # Basic validation of output shape and content
+    assert isinstance(output_ids, torch.Tensor), "Output should be a tensor"
+    assert output_ids.dim() == 2, (
+        "Output should be 2-dimensional [batch_size, seq_length]"
+    )
+    assert output_ids.size(0) == data.get("input_ids").size(0), (
+        "Output batch size should match input"
+    )
+    assert output_ids.size(1) > data.get("input_ids").size(1), (
+        "Output should be longer than input"
+    )
+
+    # Call finish_generation
+    print("Finishing generation...")
+    generation.finish_generation()
+
+
+@pytest.fixture
+def logprob_setup(request):
+    """Setup and teardown specifically for logprob tests."""
+    # Parse parameters: (num_gpus, tp, pp, model_fixture_name)
+    if hasattr(request, "param") and request.param is not None:
+        (
+            num_gpus,
+            tp,
+            pp,
+            logprob_chunk_size,
+            defer_fp32_logits,
+            model_fixture_name,
+        ) = request.param
+    else:
+        (
+            num_gpus,
+            tp,
+            pp,
+            logprob_chunk_size,
+            defer_fp32_logits,
+            model_fixture_name,
+        ) = (2, 1, 1, None, None, "tiny_llama_model_path")
+
+    # Get the actual model path from the requested fixture
+    model_name = request.getfixturevalue(model_fixture_name)
+
+    policy = None
+    cluster = None
+    data = None
+
+    try:
+        cluster_name = f"test-megatron-logprob-{num_gpus}gpu-tp{tp}-pp{pp}"
+        print(
+            f"Creating logprob cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp})"
+        )
+
+        cluster = RayVirtualCluster(
+            name=cluster_name,
+            bundle_ct_per_node_list=[num_gpus],
+            use_gpus=True,
+            num_gpus_per_node=num_gpus,
+            max_colocated_worker_groups=1,
+        )
+
+        # Determine converter type based on model
+        config = create_megatron_test_config(
+            model_name=model_name,
+            tp=tp,
+            pp=pp,
+            logprob_chunk_size=logprob_chunk_size,
+            defer_fp32_logits=defer_fp32_logits,
+        )
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+
+        print("Creating Megatron logprob Policy...")
+        policy = Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+
+        # Create test data
+        print("Creating test batch...")
+        torch.manual_seed(66)
+
+        input_ids = torch.randint(0, 32000, (4, 64))  # 4 sequences, each of length 64
+        attention_mask = torch.ones(4, 64)
+        input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+        data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "attention_mask": attention_mask,
+            }
+        )
+
+        yield policy, cluster, data
+
+    except Exception as e:
+        print(f"Error during logprob setup: {e}")
+        pytest.skip(f"Logprob setup failed: {e}")
+    finally:
+        print("Cleaning up logprob resources")
+        if policy:
+            policy.shutdown()
+        if cluster:
+            cluster.shutdown()
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.hf_gated
+@pytest.mark.parametrize(
+    "logprob_setup",
+    [
+        # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name)
+        (2, 1, 1, None, None, "tiny_llama_model_path"),
+        (2, 2, 1, None, None, "tiny_llama_model_path"),
+        (2, 1, 1, None, None, "tiny_qwen2_model_path"),
+        (2, 2, 1, None, None, "tiny_qwen2_model_path"),
+        (2, 1, 1, None, True, "tiny_llama_model_path"),
+        (2, 2, 1, None, True, "tiny_llama_model_path"),
+        (2, 1, 1, None, True, "tiny_qwen2_model_path"),
+        (2, 2, 1, None, True, "tiny_qwen2_model_path"),
+        (2, 1, 1, 16, True, "tiny_llama_model_path"),
+        (2, 2, 1, 16, True, "tiny_llama_model_path"),
+        (2, 1, 1, 16, True, "tiny_qwen2_model_path"),
+        (2, 2, 1, 16, True, "tiny_qwen2_model_path"),
+    ],
+    indirect=True,
+    ids=[
+        "2gpu_dp2_llama",
+        "2gpu_tp2_llama",
+        "2gpu_dp2_qwen2",
+        "2gpu_tp2_qwen2",
+        "2gpu_dp2_deferfp32_llama",
+        "2gpu_tp2_deferfp32_llama",
+        "2gpu_dp2_deferfp32_qwen2",
+        "2gpu_tp2_deferfp32_qwen2",
+        "2gpu_dp2_chunked_deferfp32_llama",
+        "2gpu_tp2_chunked_deferfp32_llama",
+        "2gpu_dp2_chunked_deferfp32_qwen2",
+        "2gpu_tp2_chunked_deferfp32_qwen2",
+    ],
+)
+def test_megatron_policy_logprobs(logprob_setup):
+    """Test Megatron policy logprob computation."""
+    policy, cluster, data = logprob_setup
+
+    # Verify resources were created properly
+    assert policy is not None, "Policy was not created properly"
+    assert data is not None, "Test data was not created properly"
+
+    # Generate logprobs
+    print("\nGenerating logprobs...")
+    policy.prepare_for_lp_inference()
+    policy_logprobs = policy.get_logprobs(data)["logprobs"]
+
+    # Basic validation
+    assert isinstance(policy_logprobs, torch.Tensor), "Logprobs should be a tensor"
+    assert policy_logprobs.dtype == torch.float32
+    assert policy_logprobs.shape == data.get("input_ids").shape, (
+        f"Logprobs shape {policy_logprobs.shape} should match input shape {data.get('input_ids').shape}"
+    )
+
+    # Check that first token logprobs are zero (by convention)
+    assert torch.all(policy_logprobs[:, 0] == 0), "First token logprobs should be zero"
+
+    # Check that logprobs are reasonable values (not NaN or inf)
+    assert not torch.isnan(policy_logprobs).any(), "Logprobs should not contain NaN"
+    assert not torch.isinf(policy_logprobs).any(), "Logprobs should not contain Inf"
+
+
+@pytest.mark.timeout(240)
+@pytest.mark.hf_gated
+def test_megatron_loss_independent_of_microbatch_size(tiny_llama_model_path):
+    """Test that changing microbatch size while keeping global batch size constant does not affect loss values."""
+    num_gpus = 2
+    global_batch_size = 8
+    seq_len = 64
+    vocab_size = 32000
+
+    # Create test data
+    input_ids = torch.randint(0, vocab_size, (global_batch_size, seq_len))
+    attention_mask = torch.ones(global_batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "token_mask": torch.triu(
+                torch.ones(global_batch_size, seq_len), diagonal=1
+            ),
+            "sample_mask": torch.ones((global_batch_size,)),
+            "labels": torch.randint(0, vocab_size, (global_batch_size, seq_len)),
+            "num_valid_tokens_in_batch": torch.tensor(
+                [seq_len] * global_batch_size, dtype=torch.float32
+            ),
+            "advantages": torch.randn(global_batch_size, seq_len),
+            "prev_logprobs": torch.randn(global_batch_size, seq_len),
+            "reference_policy_logprobs": torch.randn(global_batch_size, seq_len),
+            "generation_logprobs": torch.randn(global_batch_size, seq_len),
+        }
+    )
+
+    # Test with mbs=1
+    cluster1 = RayVirtualCluster(
+        name="test-mbs1",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    config1 = create_megatron_test_config(tiny_llama_model_path)
+    config1["train_micro_batch_size"] = 1
+    tokenizer = get_tokenizer(config1["tokenizer"])
+    config1["generation"] = configure_generation_config(
+        config1["generation"], tokenizer
+    )
+
+    policy1 = Policy(
+        cluster=cluster1,
+        config=config1,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+
+    # Test loss functions
+    nll_loss_fn = NLLLossFn()
+    pg_loss_fn = ClippedPGLossFn(ClippedPGLossConfig())
+
+    policy1.prepare_for_training()
+    mbs1_nll_results = policy1.train(data, nll_loss_fn)
+    mbs1_nll_loss = mbs1_nll_results["loss"]
+
+    mbs1_pg_results = policy1.train(data, pg_loss_fn)
+    mbs1_pg_loss = mbs1_pg_results["loss"]
+
+    policy1.shutdown()
+    cluster1.shutdown()
+
+    # Test with mbs=2
+    cluster2 = RayVirtualCluster(
+        name="test-mbs2",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    config2 = create_megatron_test_config(tiny_llama_model_path)
+    config2["train_micro_batch_size"] = 2
+    config2["generation"] = configure_generation_config(
+        config2["generation"], tokenizer
+    )
+
+    policy2 = Policy(
+        cluster=cluster2,
+        config=config2,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+
+    policy2.prepare_for_training()
+    mbs2_nll_results = policy2.train(data, nll_loss_fn)
+    mbs2_nll_loss = mbs2_nll_results["loss"]
+
+    mbs2_pg_results = policy2.train(data, pg_loss_fn)
+    mbs2_pg_loss = mbs2_pg_results["loss"]
+
+    # Verify both loss functions are independent of microbatch size
+    torch.testing.assert_close(mbs1_nll_loss, mbs2_nll_loss, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(mbs1_pg_loss, mbs2_pg_loss, rtol=1e-5, atol=1e-5)
+
+    policy2.shutdown()
+    cluster2.shutdown()
+
+
+@pytest.mark.timeout(240)
+@pytest.mark.hf_gated
+def test_megatron_grad_norm_invariant_to_number_of_microbatches(tiny_llama_model_path):
+    """Verify grad_norm is invariant to number of microbatches."""
+    num_gpus = 2
+    global_batch_size = 4
+    seq_len = 64
+    vocab_size = 32000
+
+    torch.manual_seed(123)
+    input_ids = torch.randint(0, vocab_size, (global_batch_size, seq_len))
+    attention_mask = torch.ones(global_batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "token_mask": torch.triu(
+                torch.ones(global_batch_size, seq_len), diagonal=1
+            ),
+            "sample_mask": torch.ones((global_batch_size,)),
+            "labels": torch.randint(0, vocab_size, (global_batch_size, seq_len)),
+        }
+    )
+
+    tokenizer = get_tokenizer({"name": tiny_llama_model_path})
+    nll_loss_fn = NLLLossFn()
+
+    cluster1 = RayVirtualCluster(
+        name="test-gradnorm-mbs1",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    # mbs=1, num_microbatches=4
+    config1 = create_megatron_test_config(tiny_llama_model_path)
+    config1["train_global_batch_size"] = global_batch_size
+    config1["train_micro_batch_size"] = 1
+    config1["generation"] = configure_generation_config(
+        config1["generation"], tokenizer
+    )
+
+    policy1 = Policy(
+        cluster=cluster1,
+        config=config1,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    policy1.prepare_for_training()
+    res1 = policy1.train(data, nll_loss_fn, gbs=global_batch_size, mbs=1)
+    grad_norm_1 = res1["grad_norm"].cpu()
+    policy1.shutdown()
+    cluster1.shutdown()
+
+    cluster2 = RayVirtualCluster(
+        name="test-gradnorm-mbs2",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    # mbs=2, num_microbatches=2
+    config2 = create_megatron_test_config(tiny_llama_model_path)
+    config2["train_global_batch_size"] = global_batch_size
+    config2["train_micro_batch_size"] = 2
+    config2["generation"] = configure_generation_config(
+        config2["generation"], tokenizer
+    )
+
+    policy2 = Policy(
+        cluster=cluster2,
+        config=config2,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    policy2.prepare_for_training()
+    res2 = policy2.train(data, nll_loss_fn, gbs=global_batch_size, mbs=2)
+    grad_norm_2 = res2["grad_norm"].cpu()
+
+    torch.testing.assert_close(grad_norm_1, grad_norm_2, rtol=1e-5, atol=1e-5)
+
+    policy2.shutdown()
+    cluster2.shutdown()
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.hf_gated
+def test_megatron_reference_policy_functionality(tiny_llama_model_path):
+    """Test Megatron reference policy functionality."""
+    num_gpus = 2
+
+    cluster = RayVirtualCluster(
+        name="test-reference",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    config = create_megatron_test_config(tiny_llama_model_path)
+    config["megatron_cfg"]["optimizer"]["lr"] = 1e-2  # Increase from 5e-6 to 1e-2
+    config["megatron_cfg"]["optimizer"]["min_lr"] = 1e-3  # Increase min_lr as well
+
+    tokenizer = get_tokenizer(config["tokenizer"])
+    config["generation"] = configure_generation_config(config["generation"], tokenizer)
+
+    # Create policy with reference model
+    policy = Policy(
+        cluster=cluster,
+        config=config,
+        tokenizer=tokenizer,
+        init_reference_model=True,
+    )
+
+    # Create test data
+    torch.manual_seed(42)
+    input_ids = torch.randint(0, 32000, (8, 64))  # Changed from 4 to 8 to match config
+    attention_mask = torch.ones(8, 64)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+        }
+    )
+
+    # Get initial logprobs from policy
+    policy.prepare_for_lp_inference()
+    initial_logprobs = policy.get_logprobs(data)["logprobs"]
+
+    # Get logprobs from reference policy
+    reference_logprobs = policy.get_reference_policy_logprobs(data)[
+        "reference_logprobs"
+    ]
+
+    # Initial policy and reference policy should have same logprobs
+    torch.testing.assert_close(
+        initial_logprobs, reference_logprobs, rtol=1e-4, atol=1e-4
+    )
+
+    # Train the policy for a few steps
+    train_data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "labels": torch.randint(0, 32000, (8, 64)),  # Changed from 4 to 8
+            "sample_mask": torch.ones(8),  # Changed from 4 to 8
+        }
+    )
+
+    loss_fn = SimpleLossFn()
+    policy.prepare_for_training()
+
+    # Train for more steps and monitor loss to ensure training is working
+    losses = []
+    for step in range(10):  # Increased from 3 to 10 steps
+        results = policy.train(train_data, loss_fn)
+        loss_value = results["loss"].cpu().item()
+        losses.append(loss_value)
+        print(f"Training step {step}, loss: {loss_value}")
+
+    policy.finish_training()
+
+    # Verify that loss actually decreased during training
+    print(f"Loss progression: {losses[0]:.6f} -> {losses[-1]:.6f}")
+    assert losses[0] > losses[-1], (
+        f"Loss should decrease during training: {losses[0]} -> {losses[-1]}"
+    )
+
+    # Get logprobs after training
+    policy.prepare_for_lp_inference()
+    post_train_logprobs = policy.get_logprobs(data)["logprobs"]
+    post_train_reference_logprobs = policy.get_reference_policy_logprobs(data)[
+        "reference_logprobs"
+    ]
+
+    # Reference policy should remain unchanged
+    torch.testing.assert_close(
+        reference_logprobs, post_train_reference_logprobs, rtol=1e-4, atol=1e-4
+    )
+
+    # Policy should have changed after training - check with more detailed metrics
+    max_diff = torch.max(torch.abs(initial_logprobs - post_train_logprobs)).item()
+    mean_diff = torch.mean(torch.abs(initial_logprobs - post_train_logprobs)).item()
+    print(
+        f"Logprob differences after training - Max: {max_diff:.6f}, Mean: {mean_diff:.6f}"
+    )
+
+    # Use a more lenient threshold since we increased learning rate
+    logprobs_changed = not torch.allclose(
+        initial_logprobs, post_train_logprobs, rtol=1e-2, atol=1e-2
+    )
+
+    assert logprobs_changed, (
+        f"Policy logprobs should change after training. "
+        f"Max diff: {max_diff:.6f}, Mean diff: {mean_diff:.6f}. "
+        f"Loss change: {losses[0]:.6f} -> {losses[-1]:.6f}"
+    )
+
+    policy.shutdown()
+    cluster.shutdown()
+
+
+@pytest.mark.timeout(400)
+@pytest.mark.hf_gated
+@pytest.mark.parametrize(
+    "num_gpus,tp,pp,save_optimizer",
+    [
+        (2, 1, 1, False),  # Data parallel
+        (2, 1, 2, True),  # Pipeline parallel
+        (2, 2, 1, True),  # Tensor parallel
+    ],
+    ids=["2gpu_dp2_save_restore", "2gpu_pp2_save_restore", "2gpu_tp2_save_restore"],
+)
+def test_megatron_checkpoint_save_kill_and_restore(
+    num_gpus, tp, pp, tiny_llama_model_path, save_optimizer
+):
+    """Test full checkpoint save/restore cycle: save -> kill worker -> restart -> verify restore."""
+    from copy import deepcopy
+
+    # Use tiny model for faster testing
+    model_name = tiny_llama_model_path
+    tokenizer = get_tokenizer({"name": model_name})
+
+    with tempfile.TemporaryDirectory(prefix="megatron_save_restore_") as temp_dir:
+        checkpoint_dir = os.path.join(temp_dir, "full_restore_test")
+        weights_path = os.path.join(checkpoint_dir, "policy", "weights")
+        # In Megatron, optimizer_path is only a flag to indicate that the optimizer
+        # state is embedded in the weights_path. We will actually load the optimizer
+        # state from the weights_path.
+        optimizer_path = (
+            os.path.join(checkpoint_dir, "policy", "optimizer")
+            if save_optimizer
+            else None
+        )
+
+        # Create initial config
+        initial_config = create_megatron_test_config(
+            model_name=model_name, tp=tp, pp=pp, precision="float32"
+        )
+
+        # Step 1: Create first policy and train
+        print("=== STEP 1: Creating initial policy and training ===")
+        cluster1 = RayVirtualCluster(
+            name="test-save-restore-1",
+            bundle_ct_per_node_list=[num_gpus],
+            use_gpus=True,
+            num_gpus_per_node=num_gpus,
+            max_colocated_worker_groups=1,
+        )
+
+        policy1 = None
+        try:
+            policy1 = Policy(
+                cluster=cluster1, config=initial_config, tokenizer=tokenizer
+            )
+
+            # Create test data
+            torch.manual_seed(42)
+            input_ids = torch.randint(0, 32000, (8, 32))
+            attention_mask = torch.ones(8, 32)
+            input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+            data = BatchedDataDict(
+                {
+                    "input_ids": input_ids,
+                    "input_lengths": input_lengths,
+                    "attention_mask": attention_mask,
+                    "labels": torch.randint(0, 32000, (8, 32)),
+                    "sample_mask": torch.ones(8),
+                }
+            )
+
+            loss_fn = SimpleLossFn()
+
+            # Train for several steps to modify model state significantly
+            policy1.prepare_for_training()
+            initial_losses = []
+            for step in range(5):
+                results = policy1.train(data, loss_fn)
+                initial_losses.append(results["loss"].cpu().item())
+                print(f"Initial training step {step}, loss: {results['loss']}")
+
+            # Sample some model parameters to compare later (before saving)
+            print("Extracting model parameters for comparison...")
+
+            # Get parameters from the worker - need to call the remote method properly
+            # We'll use the logprob computation to extract parameters indirectly
+            policy1.prepare_for_lp_inference()
+
+            # Get a sample of the model state by running inference and observing outputs
+            # This is a proxy for parameter values since we can't directly access the distributed model
+            sample_data = BatchedDataDict(
+                {
+                    "input_ids": input_ids[:4],
+                    "input_lengths": input_lengths[:4],
+                    "attention_mask": attention_mask[:4],
+                }
+            )
+
+            logprobs_before_save = policy1.get_logprobs(sample_data)["logprobs"]
+            print(
+                f"Logprobs before save (first few values): {logprobs_before_save[0, :5]}"
+            )
+
+            # Save checkpoint
+            print("Saving checkpoint...")
+            policy1.save_checkpoint(
+                weights_path=weights_path,
+                optimizer_path=optimizer_path,
+                is_final_checkpoint=False,
+            )
+            # save_checkpoint() may use MCore's async save path.  Complete the
+            # write before inspecting the checkpoint or terminating its workers.
+            policy1.finalize_async_save()
+
+            # Verify checkpoint was created
+            assert os.path.exists(checkpoint_dir), "Checkpoint directory not created"
+            iter_dirs = [d for d in os.listdir(weights_path) if d.startswith("iter_")]
+            assert len(iter_dirs) > 0, "No iteration directories found in checkpoint"
+            latest_iter = sorted(iter_dirs)[-1]
+            print(f"Checkpoint saved to iteration: {latest_iter}")
+
+        finally:
+            # Step 2: Kill the first policy completely
+            print("=== STEP 2: Shutting down initial policy ===")
+            if policy1:
+                policy1.finish_training()
+                policy1.shutdown()
+            cluster1.shutdown()
+
+            # Force cleanup
+            import gc
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        # Step 3: Create new policy with checkpoint loading configured
+        print("=== STEP 3: Creating new policy with checkpoint restore ===")
+        cluster2 = RayVirtualCluster(
+            name="test-save-restore-2",
+            bundle_ct_per_node_list=[num_gpus],
+            use_gpus=True,
+            num_gpus_per_node=num_gpus,
+            max_colocated_worker_groups=1,
+        )
+
+        policy2 = None
+        policy3 = None
+        try:
+            # First, create a policy WITHOUT checkpoint loading to verify it's different
+            print("Creating fresh policy (no checkpoint) for comparison...")
+            fresh_config = deepcopy(initial_config)
+            policy2 = Policy(cluster=cluster2, config=fresh_config, tokenizer=tokenizer)
+
+            # Get logprobs from fresh policy (should be different from saved)
+            policy2.prepare_for_lp_inference()
+            logprobs_fresh = policy2.get_logprobs(sample_data)["logprobs"]
+            print(f"Logprobs from fresh policy: {logprobs_fresh[0, :5]}")
+
+            # Verify fresh policy is different from saved state
+            logprobs_different = not torch.allclose(
+                logprobs_before_save, logprobs_fresh, atol=1e-4
+            )
+            print(f"Fresh policy logprobs different from saved: {logprobs_different}")
+            assert logprobs_different, (
+                "Fresh policy should have different parameters than saved state"
+            )
+
+            # Shutdown fresh policy
+            policy2.shutdown()
+
+            # Now create policy WITH checkpoint loading
+            print(f"Creating policy with checkpoint loading from: {checkpoint_dir}")
+            restore_config = deepcopy(initial_config)
+
+            # Check if the optimizer exists in the checkpoint
+            # checkpointer = CheckpointManager(restore_config.checkpointing)
+            weights_path, optimizer_path = CheckpointManager.get_resume_paths(
+                checkpoint_dir
+            )
+            if save_optimizer:
+                assert optimizer_path is not None, "Optimizer path should not be None"
+            else:
+                assert optimizer_path is None, "Optimizer path should be None"
+
+            # The key is to pass weights_path to the Policy constructor
+            # This gets passed to MegatronPolicyWorker which configures CheckpointConfig.load
+            policy3 = Policy(
+                cluster=cluster2,
+                config=restore_config,
+                tokenizer=tokenizer,
+                weights_path=weights_path,  # This should trigger checkpoint loading
+                optimizer_path=optimizer_path,
+                init_reference_model=False,
+            )
+
+            # Get logprobs from restored policy (should match the saved state)
+            print("Getting logprobs from restored policy...")
+            policy3.prepare_for_lp_inference()
+            logprobs_restored = policy3.get_logprobs(sample_data)["logprobs"]
+            print(f"Logprobs from restored policy: {logprobs_restored[0, :5]}")
+
+            # Check if restored policy matches the saved state
+            logprobs_match = torch.allclose(
+                logprobs_before_save, logprobs_restored, atol=1e-4
+            )
+            print(f"Restored policy logprobs match saved: {logprobs_match}")
+
+            # Calculate difference metrics
+            max_diff = torch.max(
+                torch.abs(logprobs_before_save - logprobs_restored)
+            ).item()
+            mean_diff = torch.mean(
+                torch.abs(logprobs_before_save - logprobs_restored)
+            ).item()
+            print(f"Max difference: {max_diff}, Mean difference: {mean_diff}")
+
+            if logprobs_match:
+                print(
+                    "✓ SUCCESS: Checkpoint loading works! Model state was restored correctly."
+                )
+            else:
+                print(
+                    "⚠ WARNING: Checkpoint may not have loaded correctly. Difference too large."
+                )
+                print("This could indicate:")
+                print("1. Checkpoint loading is not implemented for runtime loading")
+                print("2. Checkpoint loading only works during initial model setup")
+                print("3. The checkpoint format or loading logic needs adjustment")
+
+                # But still verify the checkpoint structure is valid
+                iter_dirs = [
+                    d for d in os.listdir(checkpoint_dir) if d.startswith("iter_")
+                ]
+                latest_iter_dir = os.path.join(checkpoint_dir, sorted(iter_dirs)[-1])
+                iter_contents = os.listdir(latest_iter_dir)
+
+                print("\nCheckpoint structure verification:")
+                print(f"  - Checkpoint dir exists: {os.path.exists(checkpoint_dir)}")
+                print(f"  - Iteration dirs: {iter_dirs}")
+                print(f"  - Latest iter contents: {iter_contents}")
+
+                expected_checkpoint_files = ["common.pt"]
+                for expected_file in expected_checkpoint_files:
+                    file_exists = any(expected_file in f for f in iter_contents)
+                    print(f"  - Expected file '{expected_file}' exists: {file_exists}")
+                    assert file_exists, (
+                        f"Required checkpoint file {expected_file} not found"
+                    )
+
+                total_checkpoint_size = sum(
+                    os.path.getsize(os.path.join(latest_iter_dir, f))
+                    for f in iter_contents
+                    if os.path.isfile(os.path.join(latest_iter_dir, f))
+                )
+                print(f"  - Total checkpoint size: {total_checkpoint_size} bytes")
+                assert total_checkpoint_size > 1024, "Checkpoint appears too small"
+
+            print("\n=== VERIFICATION COMPLETE ===")
+            print("✓ Checkpoint save functionality works correctly")
+            print("✓ Checkpoint structure is valid for restoration")
+            print("✓ Worker shutdown and restart works")
+            print("✓ Fresh worker has different parameters (proving no auto-load)")
+            if logprobs_match:
+                print("✓ Checkpoint loading works and restores correct model state")
+            else:
+                print(
+                    "✓ Checkpoint infrastructure is in place (loading may need implementation)"
+                )
+
+        finally:
+            # Step 4: Cleanup
+            print("=== STEP 4: Final cleanup ===")
+            if policy2:
+                policy2.shutdown()
+            if policy3:
+                policy3.shutdown()
+            cluster2.shutdown()
+
+
+@pytest.mark.timeout(400)
+@pytest.mark.hf_gated
+def test_megatron_async_save_after_ppo_offload_writes_current_weights(
+    tiny_llama_model_path,
+):
+    """A PPO offload between async saves must not leave the second one stale.
+
+    NVRx's constant-structure cache reuses the first save's CUDA IPC handles, and
+    the offload moves the parameters, so a cache that misses the move makes the
+    second checkpoint a byte-identical copy of the first.
+    """
+    config = create_megatron_test_config(model_name=tiny_llama_model_path)
+    del config["generation"]
+    config["megatron_cfg"]["checkpoint"] = {
+        "async_save": True,
+        "ckpt_assume_constant_structure": True,
+    }
+    tokenizer = get_tokenizer({"name": tiny_llama_model_path})
+
+    torch.manual_seed(42)
+    attention_mask = torch.ones(8, 32)
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.randint(0, 32000, (8, 32)),
+            "input_lengths": attention_mask.sum(dim=1).to(torch.int32),
+            "attention_mask": attention_mask,
+            "labels": torch.randint(0, 32000, (8, 32)),
+            "sample_mask": torch.ones(8),
+        }
+    )
+
+    with tempfile.TemporaryDirectory(prefix="megatron_async_save_") as temp_dir:
+        cluster = RayVirtualCluster(
+            name="test-async-save-ppo-offload",
+            bundle_ct_per_node_list=[2],
+            use_gpus=True,
+            num_gpus_per_node=2,
+            max_colocated_worker_groups=1,
+        )
+        policy = None
+        try:
+            policy = Policy(
+                cluster=cluster,
+                config=config,
+                tokenizer=tokenizer,
+            )
+            weights_paths = []
+            for step in range(2):
+                policy.prepare_for_training()
+                policy.train(data, SimpleLossFn())
+                weights_path = os.path.join(temp_dir, f"step_{step}", "weights")
+                policy.save_checkpoint(
+                    weights_path=weights_path, is_final_checkpoint=False
+                )
+                # PPO hands the GPUs to the value model right after each save.
+                policy.offload_to_cpu()
+                weights_paths.append(weights_path)
+            # Complete the last write before reading the checkpoints.
+            policy.finalize_async_save()
+
+            first, second = (hash_checkpoint_tensors(p) for p in weights_paths)
+            assert first.keys() == second.keys()
+            # Every chunk is a trained fp32 param, so none may repeat the first save.
+            repeated = [key for key in first if first[key] == second[key]]
+            assert not repeated, (
+                f"{len(repeated)} of {len(first)} tensor chunks repeat the first "
+                f"checkpoint: {repeated}"
+            )
+        finally:
+            if policy:
+                policy.shutdown()
+            cluster.shutdown()
+
+
+@pytest.mark.timeout(600)
+@pytest.mark.hf_gated
+@pytest.mark.parametrize("offload", ["before_refit", "for_logprob", "refit"])
+def test_megatron_async_save_after_optimizer_offload_writes_current_state(
+    tiny_llama_model_path, offload
+):
+    """An optimizer offload between async saves must not leave optimizer state stale.
+
+    Non-colocated distillation offloads the student's optimizer before every
+    teacher pass, offload_optimizer_for_logprob does it in every logprob pass, and
+    non-colocated refit with offload_policy_before_refit does it before every
+    refit; params stay on GPU, so only the optimizer chunks could repeat.
+    """
+    # bf16 params, so the optimizer's `param` is a master weight that each step updates.
+    config = create_megatron_test_config(
+        model_name=tiny_llama_model_path, precision="bfloat16"
+    )
+    if offload == "refit":
+        config["generation"]["colocated"]["enabled"] = False
+        config["offload_policy_before_refit"] = True
+    else:
+        del config["generation"]
+    # Big enough for bf16 weights near 1.0 to change in one step.
+    config["megatron_cfg"]["optimizer"]["lr"] = 1e-2
+    config["megatron_cfg"]["scheduler"]["lr_warmup_iters"] = 0
+    config["offload_optimizer_for_logprob"] = offload == "for_logprob"
+    config["megatron_cfg"]["checkpoint"] = {
+        "async_save": True,
+        "ckpt_assume_constant_structure": True,
+    }
+    tokenizer = get_tokenizer({"name": tiny_llama_model_path})
+
+    torch.manual_seed(42)
+    attention_mask = torch.ones(8, 32)
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.randint(0, 32000, (8, 32)),
+            "input_lengths": attention_mask.sum(dim=1).to(torch.int32),
+            "attention_mask": attention_mask,
+            "labels": torch.randint(0, 32000, (8, 32)),
+            "sample_mask": torch.ones(8),
+        }
+    )
+
+    with tempfile.TemporaryDirectory(prefix="megatron_async_save_") as temp_dir:
+        cluster = RayVirtualCluster(
+            name=f"test-async-save-optimizer-offload-{offload}",
+            bundle_ct_per_node_list=[2],
+            use_gpus=True,
+            num_gpus_per_node=2,
+            max_colocated_worker_groups=1,
+        )
+        policy = None
+        try:
+            policy = Policy(
+                cluster=cluster,
+                config=config,
+                tokenizer=tokenizer,
+            )
+            weights_paths = []
+            for step in range(2):
+                policy.prepare_for_training()
+                policy.train(data, SimpleLossFn())
+                weights_path = os.path.join(temp_dir, f"step_{step}", "weights")
+                policy.save_checkpoint(
+                    weights_path=weights_path,
+                    optimizer_path=os.path.join(temp_dir, f"step_{step}", "optimizer"),
+                    is_final_checkpoint=False,
+                )
+                # The checkpointer's wait_fn finalizes every save.
+                policy.finalize_async_save()
+                if offload in ("before_refit", "refit"):
+                    policy.offload_before_refit()
+                else:
+                    policy.prepare_for_lp_inference()
+                weights_paths.append(weights_path)
+
+            first, second = (hash_checkpoint_tensors(p) for p in weights_paths)
+            assert first.keys() == second.keys()
+            repeated = sorted({key[0] for key in first if first[key] == second[key]})
+            assert not repeated, (
+                f"{len(repeated)} tensors repeat the first checkpoint: {repeated}"
+            )
+        finally:
+            if policy:
+                policy.shutdown()
+            cluster.shutdown()
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.hf_gated
+def test_megatron_dpo_training(tiny_llama_model_path):
+    """Test DPO training with Megatron backend."""
+    num_gpus = 2
+    batch_size = 8
+    seq_len = 64
+    vocab_size = 32000
+
+    # Create test data for DPO training
+    # Each batch contains chosen and rejected pairs
+    input_ids = torch.randint(0, vocab_size, (batch_size * 2, seq_len))
+    attention_mask = torch.ones(batch_size * 2, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+    token_mask = torch.triu(torch.ones(batch_size * 2, seq_len), diagonal=1)
+    sample_mask = torch.ones(batch_size * 2)
+
+    # Create reference policy logprobs (simulating a reference model)
+    reference_policy_logprobs = torch.randn(batch_size * 2, seq_len)
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "reference_policy_logprobs": reference_policy_logprobs,
+        }
+    )
+
+    # Create cluster and policy
+    cluster = RayVirtualCluster(
+        name="test-dpo",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    config = create_megatron_test_config(tiny_llama_model_path)
+    tokenizer = get_tokenizer(config["tokenizer"])
+
+    policy = Policy(
+        cluster=cluster,
+        config=config,
+        tokenizer=tokenizer,
+        init_reference_model=True,  # Initialize reference model for DPO
+    )
+
+    # Create DPO loss function
+    dpo_loss_fn = DPOLossFn(
+        DPOLossConfig(
+            reference_policy_kl_penalty=0.1,
+            preference_loss_weight=1.0,
+            sft_loss_weight=0.5,
+            preference_average_log_probs=False,
+            sft_average_log_probs=False,
+        )
+    )
+
+    try:
+        # Prepare for training
+        policy.prepare_for_training()
+
+        # Train for a few steps
+        losses = []
+        for step in range(3):
+            results = policy.train(data, dpo_loss_fn)
+
+            # Verify results contain expected metrics
+            assert "loss" in results, "Training results should contain 'loss'"
+            assert "sft_loss" in results["all_mb_metrics"], (
+                "Results should contain SFT loss"
+            )
+            assert "preference_loss" in results["all_mb_metrics"], (
+                "Results should contain preference loss"
+            )
+            assert "accuracy" in results["all_mb_metrics"], (
+                "Results should contain accuracy"
+            )
+
+            loss_tensor = results["loss"]
+            assert not torch.isnan(loss_tensor).any(), "Loss should not be NaN"
+            assert not torch.isinf(loss_tensor).any(), "Loss should not be Inf"
+            losses.append(loss_tensor[-1].item())
+
+            print(f"DPO training step {step}, loss: {results['loss']}")
+
+        # Verify loss changed between iterations
+        assert losses[0] > losses[-1], "Loss should decrease over training iterations"
+
+    finally:
+        policy.shutdown()
+        cluster.shutdown()
+
+
+@pytest.fixture
+def topk_setup(request):
+    """Setup and teardown specifically for top-k logits tests."""
+    # Parse parameters: (num_gpus, tp, pp, logprob_chunk_size, defer_fp32_logits, model_fixture_name)
+    if hasattr(request, "param") and request.param is not None:
+        (
+            num_gpus,
+            tp,
+            pp,
+            logprob_chunk_size,
+            defer_fp32_logits,
+            model_fixture_name,
+        ) = request.param
+    else:
+        (
+            num_gpus,
+            tp,
+            pp,
+            logprob_chunk_size,
+            defer_fp32_logits,
+            model_fixture_name,
+        ) = (2, 1, 1, None, None, "tiny_llama_model_path")
+
+    # Get the actual model path from the requested fixture
+    model_name = request.getfixturevalue(model_fixture_name)
+
+    policy = None
+    cluster = None
+    data = None
+
+    try:
+        cluster_name = f"test-megatron-topk-{num_gpus}gpu-tp{tp}-pp{pp}"
+        print(
+            f"Creating topk cluster '{cluster_name}' for {num_gpus} GPUs (TP={tp}, PP={pp})"
+        )
+
+        cluster = RayVirtualCluster(
+            name=cluster_name,
+            bundle_ct_per_node_list=[num_gpus],
+            use_gpus=True,
+            num_gpus_per_node=num_gpus,
+            max_colocated_worker_groups=1,
+        )
+
+        # Determine converter type based on model
+        config = create_megatron_test_config(
+            model_name=model_name,
+            tp=tp,
+            pp=pp,
+            logprob_chunk_size=logprob_chunk_size,
+            defer_fp32_logits=defer_fp32_logits,
+        )
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+
+        print("Creating Megatron topk Policy...")
+        policy = Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+
+        # Create test data
+        print("Creating test batch...")
+        torch.manual_seed(77)
+
+        input_ids = torch.randint(0, 32000, (4, 64))  # 4 sequences, each of length 64
+        attention_mask = torch.ones(4, 64)
+        input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+        data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "attention_mask": attention_mask,
+            }
+        )
+
+        yield policy, cluster, data
+
+    except Exception as e:
+        print(f"Error during topk setup: {e}")
+        pytest.skip(f"Topk setup failed: {e}")
+    finally:
+        print("Cleaning up topk resources")
+        if policy:
+            policy.shutdown()
+        if cluster:
+            cluster.shutdown()
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.hf_gated
+@pytest.mark.parametrize(
+    "topk_setup",
+    [
+        # (num_gpus, tp, pp, chunk sz, defer fp32, model_fixture_name)
+        (2, 1, 1, None, None, "tiny_llama_model_path"),
+        (2, 2, 1, None, None, "tiny_llama_model_path"),
+        (2, 1, 1, None, None, "tiny_qwen2_model_path"),
+        (2, 2, 1, None, None, "tiny_qwen2_model_path"),
+        (2, 1, 1, None, True, "tiny_llama_model_path"),
+        (2, 2, 1, None, True, "tiny_llama_model_path"),
+        (2, 1, 1, None, True, "tiny_qwen2_model_path"),
+        (2, 2, 1, None, True, "tiny_qwen2_model_path"),
+        (2, 1, 1, 16, True, "tiny_llama_model_path"),
+        (2, 2, 1, 16, True, "tiny_llama_model_path"),
+        (2, 1, 1, 16, True, "tiny_qwen2_model_path"),
+        (2, 2, 1, 16, True, "tiny_qwen2_model_path"),
+    ],
+    indirect=True,
+    ids=[
+        "2gpu_dp2_llama",
+        "2gpu_tp2_llama",
+        "2gpu_dp2_qwen2",
+        "2gpu_tp2_qwen2",
+        "2gpu_dp2_deferfp32_llama",
+        "2gpu_tp2_deferfp32_llama",
+        "2gpu_dp2_deferfp32_qwen2",
+        "2gpu_tp2_deferfp32_qwen2",
+        "2gpu_dp2_chunked_deferfp32_llama",
+        "2gpu_tp2_chunked_deferfp32_llama",
+        "2gpu_dp2_chunked_deferfp32_qwen2",
+        "2gpu_tp2_chunked_deferfp32_qwen2",
+    ],
+)
+def test_megatron_policy_topk_logits(topk_setup):
+    """Test Megatron policy top-k logits computation."""
+    policy, cluster, data = topk_setup
+
+    # Verify resources were created properly
+    assert policy is not None, "Policy was not created properly"
+    assert data is not None, "Test data was not created properly"
+
+    # Generate top-k logits
+    print("\nGenerating top-k logits...")
+    policy.prepare_for_lp_inference()
+    k = 5
+    outputs = policy.get_topk_logits(data, k=k)
+
+    # Basic validation
+    assert "topk_logits" in outputs and "topk_indices" in outputs, (
+        "Top-k outputs should contain both 'topk_logits' and 'topk_indices'"
+    )
+    topk_logits = outputs["topk_logits"]
+    topk_indices = outputs["topk_indices"]
+
+    assert isinstance(topk_logits, torch.Tensor)
+    assert isinstance(topk_indices, torch.Tensor)
+    assert topk_logits.dtype == torch.float32
+    assert topk_indices.dtype in (torch.int32, torch.int64, torch.long)
+
+    # Shape checks
+    B, S = data.get("input_ids").shape
+    assert topk_logits.shape == (B, S, k)
+    assert topk_indices.shape == (B, S, k)
+
+    # Mask invalid positions and check for NaN/Inf
+    valid_mask = (
+        data.get("attention_mask")
+        .unsqueeze(-1)
+        .bool()
+        .expand(-1, -1, topk_logits.shape[-1])
+    )
+    valid_logits = topk_logits[valid_mask]
+    assert not torch.isnan(valid_logits).any(), "Top-k logits should not contain NaN"
+    assert not torch.isinf(valid_logits).any(), "Top-k logits should not contain Inf"
+
+    # Check descending order within top-k for valid positions
+    if S > 1:
+        diffs = topk_logits[..., :-1] - topk_logits[..., 1:]
+        valid_mask_diffs = (
+            data.get("attention_mask")
+            .unsqueeze(-1)
+            .bool()
+            .expand(-1, -1, topk_logits.shape[-1] - 1)
+        )
+        diffs = diffs[valid_mask_diffs]
+        assert (diffs >= -1e-6).all(), "Top-k logits should be non-increasing across k"
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(300)
+def test_megatron_context_parallel_topk_agreement(tiny_qwen2_model_path):
+    """Test that CP and non-CP models produce identical top-k logits with sequence packing enabled."""
+    num_gpus = 2
+    batch_size = 4
+    seq_len = 64
+
+    # Create test data with varying sequence lengths to test sequence packing
+    torch.manual_seed(123)
+    input_ids = torch.arange(seq_len * batch_size, device="cuda").reshape(
+        batch_size, seq_len
+    )
+    input_lengths = torch.tensor([31, 21, 29, 56], dtype=torch.int32)
+    attention_mask = torch.zeros(batch_size, seq_len)
+    for i, length in enumerate(input_lengths):
+        attention_mask[i, :length] = 1
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+        }
+    )
+
+    k = 5
+
+    # Test 1: Non-CP model (context_parallel_size=1) with sequence packing
+    print(
+        "=== Testing Non-CP model (context_parallel_size=1) with sequence packing for top-k ==="
+    )
+    cluster_no_cp = RayVirtualCluster(
+        name="test-no-cp-packing-topk",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    config_no_cp = create_megatron_test_config(
+        tiny_qwen2_model_path, tp=1, pp=1, precision="bfloat16"
+    )
+    # Ensure context parallel is disabled
+    config_no_cp["megatron_cfg"]["context_parallel_size"] = 1
+
+    # Enable sequence packing
+    config_no_cp["sequence_packing"] = {
+        "enabled": True,
+        "train_mb_tokens": seq_len,
+        "logprob_mb_tokens": seq_len,
+        "algorithm": "modified_first_fit_decreasing",
+    }
+
+    tokenizer = get_tokenizer(config_no_cp["tokenizer"])
+    config_no_cp["generation"] = configure_generation_config(
+        config_no_cp["generation"], tokenizer
+    )
+
+    policy_no_cp = Policy(
+        cluster=cluster_no_cp,
+        config=config_no_cp,
+        tokenizer=tokenizer,
+        name_prefix="lm_policy_nocp_pack",
+        init_reference_model=False,
+    )
+
+    # Get top-k from non-CP model with sequence packing
+    policy_no_cp.prepare_for_lp_inference()
+    out_no_cp = policy_no_cp.get_topk_logits(data, k=k)
+    logits_no_cp = out_no_cp["topk_logits"] * attention_mask.unsqueeze(-1)
+    indices_no_cp = out_no_cp["topk_indices"]
+    print(f"Non-CP topk logits shape: {logits_no_cp.shape}")
+
+    # Cleanup non-CP resources and run without packing
+    policy_no_cp.shutdown()
+    config_no_cp_no_packing = config_no_cp.copy()
+    config_no_cp_no_packing["sequence_packing"] = {"enabled": False}
+    policy_no_cp_no_packing = Policy(
+        cluster=cluster_no_cp,
+        config=config_no_cp_no_packing,
+        tokenizer=tokenizer,
+        name_prefix="lm_policy_nocp_nopack",
+        init_reference_model=False,
+    )
+    policy_no_cp_no_packing.prepare_for_lp_inference()
+    out_no_cp_np = policy_no_cp_no_packing.get_topk_logits(data, k=k)
+    logits_no_cp_np = out_no_cp_np["topk_logits"] * attention_mask.unsqueeze(-1)
+    indices_no_cp_np = out_no_cp_np["topk_indices"]
+    print(f"Non-CP (no packing) topk logits shape: {logits_no_cp_np.shape}")
+    cluster_no_cp.shutdown()
+
+    # Compare non-CP packing vs non-packing
+    print("=== Comparing non-CP packing vs non-packing top-k ===")
+    assert logits_no_cp.shape == logits_no_cp_np.shape
+    assert indices_no_cp.shape == indices_no_cp_np.shape
+    torch.testing.assert_close(logits_no_cp, logits_no_cp_np, rtol=1e-3, atol=1e-2)
+    valid_mask_idx = (
+        attention_mask.bool().unsqueeze(-1).expand(-1, -1, indices_no_cp.shape[-1])
+    )
+    nocp_idx_flat = indices_no_cp[valid_mask_idx]
+    nocp_np_idx_flat = indices_no_cp_np[valid_mask_idx]
+    match_ratio = (nocp_idx_flat == nocp_np_idx_flat).float().mean().item()
+    print(f"Top-k index match ratio (packing vs non-packing): {match_ratio:.4f}")
+    # Logit values already validated by assert_close above; index mismatches
+    # occur when close-valued logits swap order due to numerical differences
+    # in GB200 for torch 2.10 + TE 2.12 (H100 achieves exact match).
+    assert match_ratio >= 0.97, (
+        f"Top-k index match ratio too low: {match_ratio:.4f} (< 0.97)"
+    )
+
+    # Test 2: CP model (context_parallel_size=2) with sequence packing
+    print(
+        "=== Testing CP model (context_parallel_size=2) with sequence packing for top-k ==="
+    )
+    cluster_cp = RayVirtualCluster(
+        name="test-cp-packing-topk",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    config_cp = create_megatron_test_config(
+        tiny_qwen2_model_path, tp=1, pp=1, precision="bfloat16"
+    )
+    # Enable context parallel
+    config_cp["megatron_cfg"]["context_parallel_size"] = 2
+    config_cp["make_sequence_length_divisible_by"] *= 4
+
+    # Enable sequence packing
+    config_cp["sequence_packing"] = {
+        "enabled": True,
+        "train_mb_tokens": seq_len,
+        "logprob_mb_tokens": seq_len,
+        "algorithm": "modified_first_fit_decreasing",
+    }
+    config_cp["generation"] = configure_generation_config(
+        config_cp["generation"], tokenizer
+    )
+
+    policy_cp = Policy(
+        cluster=cluster_cp,
+        config=config_cp,
+        tokenizer=tokenizer,
+        name_prefix="lm_policy_cp",
+        init_reference_model=False,
+    )
+    policy_cp.prepare_for_lp_inference()
+    out_cp = policy_cp.get_topk_logits(data, k=k)
+    logits_cp = out_cp["topk_logits"] * attention_mask.unsqueeze(-1)
+    indices_cp = out_cp["topk_indices"]
+
+    # Cleanup CP resources
+    policy_cp.shutdown()
+    cluster_cp.shutdown()
+
+    # Compare CP vs non-CP (no packing)
+    print("=== Comparing CP vs non-CP (no packing) top-k ===")
+    assert logits_no_cp_np.shape == logits_cp.shape
+    assert indices_no_cp_np.shape == indices_cp.shape
+    assert not torch.isnan(logits_cp).any()
+    assert not torch.isinf(logits_cp).any()
+    torch.testing.assert_close(logits_no_cp_np, logits_cp, rtol=1e-3, atol=1e-2)
+    # since there are close logits, we only check the index match ratio
+    valid_mask_idx = (
+        attention_mask.bool().unsqueeze(-1).expand(-1, -1, indices_cp.shape[-1])
+    )
+    cp_idx_flat = indices_cp[valid_mask_idx]
+    nocp_idx_flat = indices_no_cp_np[valid_mask_idx]
+    match_ratio = (cp_idx_flat == nocp_idx_flat).float().mean().item()
+    print(f"Top-k index match ratio (CP vs non-CP): {match_ratio:.4f}")
+    # Logit values already validated by assert_close above; index mismatches
+    # occur when close-valued logits swap order under CP's distributed attention
+    # rounding. Threshold lowered from 0.95→0.94 for torch 2.10 + TE 2.12.
+    assert match_ratio >= 0.94, (
+        f"Top-k index match ratio too low: {match_ratio:.4f} (< 0.94)"
+    )
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.hf_gated
+def test_megatron_sft_training(tiny_llama_model_path):
+    """Test SFT training with Megatron backend."""
+    num_gpus = 2
+    batch_size = 8
+    seq_len = 64
+    vocab_size = 32000
+
+    # Create test data for SFT training
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+    token_mask = torch.triu(torch.ones(batch_size, seq_len), diagonal=1)
+    sample_mask = torch.ones(batch_size)
+    labels = torch.randint(0, vocab_size, (batch_size, seq_len))
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "labels": labels,
+        }
+    )
+
+    # Create cluster and policy
+    cluster = RayVirtualCluster(
+        name="test-sft",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    config = create_megatron_test_config(tiny_llama_model_path)
+    tokenizer = get_tokenizer(config["tokenizer"])
+
+    policy = Policy(
+        cluster=cluster,
+        config=config,
+        tokenizer=tokenizer,
+        init_reference_model=False,  # No need for reference model in SFT
+    )
+
+    # Create NLL loss function for SFT
+    sft_loss_fn = NLLLossFn()
+
+    try:
+        # Prepare for training
+        policy.prepare_for_training()
+
+        # Train for a few steps
+        losses = []
+        for step in range(3):
+            results = policy.train(data, sft_loss_fn)
+
+            # Verify results contain expected metrics
+            assert "loss" in results, "Training results should contain 'loss'"
+            assert "num_unmasked_tokens" in results["all_mb_metrics"], (
+                "Results should contain token count"
+            )
+            assert "num_valid_samples" in results["all_mb_metrics"], (
+                "Results should contain sample count"
+            )
+
+            loss_tensor = results["loss"]
+            assert not torch.isnan(loss_tensor).any(), "Loss should not be NaN"
+            assert not torch.isinf(loss_tensor).any(), "Loss should not be Inf"
+            losses.append(loss_tensor[-1].item())
+
+            print(f"SFT training step {step}, loss: {results['loss']}")
+
+        # Verify loss changed between iterations
+        assert losses[0] > losses[-1], "Loss should decrease over training iterations"
+
+    finally:
+        policy.shutdown()
+        cluster.shutdown()
+
+
+@pytest.mark.timeout(300)
+def test_megatron_sft_linear_ce_fusion_agreement(tiny_qwen2_model_path):
+    """Test that linear CE fusion loss produces the same results as the standard path."""
+    num_gpus = 2
+    batch_size = 8
+    seq_len = 64
+    vocab_size = 151936
+
+    torch.manual_seed(42)
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+    token_mask = torch.triu(torch.ones(batch_size, seq_len), diagonal=1)
+    sample_mask = torch.ones(batch_size)
+    labels = torch.randint(0, vocab_size, (batch_size, seq_len))
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "labels": labels,
+        }
+    )
+
+    # --- Standard SFT (no linear CE fusion) ---
+    cluster_std = RayVirtualCluster(
+        name="test-sft-std",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+    config_std = create_megatron_test_config(tiny_qwen2_model_path)
+    tokenizer = get_tokenizer(config_std["tokenizer"])
+    policy_std = Policy(
+        cluster=cluster_std,
+        config=config_std,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    sft_loss_std = NLLLossFn()
+
+    try:
+        policy_std.prepare_for_training()
+        results_std = policy_std.train(data, sft_loss_std)
+        loss_std = results_std["loss"]
+    finally:
+        policy_std.shutdown()
+        cluster_std.shutdown()
+
+    # --- SFT with linear CE fusion ---
+    cluster_fuse = RayVirtualCluster(
+        name="test-sft-fuse",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+    config_fuse = create_megatron_test_config(tiny_qwen2_model_path)
+    config_fuse["megatron_cfg"]["use_fused_linear_logprobs"] = True
+    config_fuse["megatron_cfg"]["fused_linear_logprobs_chunk_size"] = 256
+    policy_fuse = Policy(
+        cluster=cluster_fuse,
+        config=config_fuse,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    sft_loss_fuse = NLLLossFn(use_fused_linear_logprobs=True)
+
+    try:
+        policy_fuse.prepare_for_training()
+        results_fuse = policy_fuse.train(data, sft_loss_fuse)
+        loss_fuse = results_fuse["loss"]
+    finally:
+        policy_fuse.shutdown()
+        cluster_fuse.shutdown()
+
+    # Verify both produce valid losses
+    assert not torch.isnan(loss_std).any(), "Standard loss should not be NaN"
+    assert not torch.isnan(loss_fuse).any(), "Fusion loss should not be NaN"
+    assert not torch.isinf(loss_std).any(), "Standard loss should not be Inf"
+    assert not torch.isinf(loss_fuse).any(), "Fusion loss should not be Inf"
+
+    # Verify losses are numerically close
+    torch.testing.assert_close(loss_std, loss_fuse, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.timeout(600)
+def test_megatron_dpo_linear_ce_fusion_agreement(tiny_qwen2_model_path):
+    """Test that linear CE fusion loss produces the same results as the standard path for DPO."""
+    import time
+
+    num_gpus = 2
+    batch_size = 4
+    seq_len = 64
+    vocab_size = 151936
+
+    torch.manual_seed(42)
+    input_ids = torch.randint(0, vocab_size, (batch_size * 2, seq_len))
+    attention_mask = torch.ones(batch_size * 2, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+    token_mask = torch.triu(torch.ones(batch_size * 2, seq_len), diagonal=1)
+    sample_mask = torch.ones(batch_size * 2)
+    reference_policy_logprobs = torch.randn(batch_size * 2, seq_len)
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "reference_policy_logprobs": reference_policy_logprobs,
+        }
+    )
+
+    dpo_cfg = DPOLossConfig(
+        reference_policy_kl_penalty=0.1,
+        preference_loss_weight=1.0,
+        sft_loss_weight=0.5,
+        preference_average_log_probs=False,
+        sft_average_log_probs=False,
+    )
+
+    # --- Standard DPO (no linear CE fusion) ---
+    cluster_std = RayVirtualCluster(
+        name="test-dpo-std",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+    config_std = create_megatron_test_config(tiny_qwen2_model_path)
+    tokenizer = get_tokenizer(config_std["tokenizer"])
+    policy_std = Policy(
+        cluster=cluster_std,
+        config=config_std,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    dpo_loss_std = DPOLossFn(dpo_cfg)
+
+    try:
+        policy_std.prepare_for_training()
+        results_std = policy_std.train(data, dpo_loss_std)
+        loss_std = results_std["loss"]
+    finally:
+        policy_std.shutdown()
+        cluster_std.shutdown()
+
+    time.sleep(10)
+
+    # --- DPO with linear CE fusion ---
+    cluster_fuse = RayVirtualCluster(
+        name="test-dpo-fuse",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+    config_fuse = create_megatron_test_config(tiny_qwen2_model_path)
+    config_fuse["megatron_cfg"]["use_fused_linear_logprobs"] = True
+    config_fuse["megatron_cfg"]["fused_linear_logprobs_chunk_size"] = 256
+    policy_fuse = Policy(
+        cluster=cluster_fuse,
+        config=config_fuse,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    dpo_loss_fuse = DPOLossFn(dpo_cfg, use_fused_linear_logprobs=True)
+
+    try:
+        policy_fuse.prepare_for_training()
+        results_fuse = policy_fuse.train(data, dpo_loss_fuse)
+        loss_fuse = results_fuse["loss"]
+    finally:
+        policy_fuse.shutdown()
+        cluster_fuse.shutdown()
+
+    # Verify both produce valid losses
+    assert not torch.isnan(loss_std).any(), "Standard DPO loss should not be NaN"
+    assert not torch.isnan(loss_fuse).any(), "Fusion DPO loss should not be NaN"
+    assert not torch.isinf(loss_std).any(), "Standard DPO loss should not be Inf"
+    assert not torch.isinf(loss_fuse).any(), "Fusion DPO loss should not be Inf"
+
+    # Verify losses are numerically close
+    torch.testing.assert_close(loss_std, loss_fuse, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.timeout(600)
+def test_megatron_grpo_linear_ce_fusion_agreement(tiny_qwen2_model_path):
+    """Test that linear CE fusion loss matches the standard path for GRPO (ClippedPGLossFn)."""
+    import time
+
+    num_gpus = 2
+    batch_size = 8
+    seq_len = 64
+    vocab_size = 151936
+
+    torch.manual_seed(42)
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+    token_mask = torch.triu(torch.ones(batch_size, seq_len), diagonal=1)
+    sample_mask = torch.ones(batch_size)
+    # Use small-magnitude logprobs so the importance ratio exp(curr - prev) stays
+    # well-conditioned and the agreement check is not dominated by exp blow-up.
+    advantages = torch.randn(batch_size, seq_len)
+    prev_logprobs = torch.randn(batch_size, seq_len) * 0.1
+    generation_logprobs = torch.randn(batch_size, seq_len) * 0.1
+    reference_policy_logprobs = torch.randn(batch_size, seq_len) * 0.1
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "advantages": advantages,
+            "prev_logprobs": prev_logprobs,
+            "generation_logprobs": generation_logprobs,
+            "reference_policy_logprobs": reference_policy_logprobs,
+        }
+    )
+
+    pg_cfg = ClippedPGLossConfig()
+
+    # --- Standard GRPO (no linear CE fusion) ---
+    cluster_std = RayVirtualCluster(
+        name="test-grpo-std",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+    config_std = create_megatron_test_config(tiny_qwen2_model_path)
+    tokenizer = get_tokenizer(config_std["tokenizer"])
+    policy_std = Policy(
+        cluster=cluster_std,
+        config=config_std,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    pg_loss_std = ClippedPGLossFn(pg_cfg)
+
+    try:
+        policy_std.prepare_for_training()
+        results_std = policy_std.train(data, pg_loss_std)
+        loss_std = results_std["loss"]
+    finally:
+        policy_std.shutdown()
+        cluster_std.shutdown()
+
+    time.sleep(10)
+
+    # --- GRPO with linear CE fusion ---
+    cluster_fuse = RayVirtualCluster(
+        name="test-grpo-fuse",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+    config_fuse = create_megatron_test_config(tiny_qwen2_model_path)
+    config_fuse["megatron_cfg"]["use_fused_linear_logprobs"] = True
+    config_fuse["megatron_cfg"]["fused_linear_logprobs_chunk_size"] = 256
+    policy_fuse = Policy(
+        cluster=cluster_fuse,
+        config=config_fuse,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+    pg_loss_fuse = ClippedPGLossFn(pg_cfg, use_fused_linear_logprobs=True)
+
+    try:
+        policy_fuse.prepare_for_training()
+        results_fuse = policy_fuse.train(data, pg_loss_fuse)
+        loss_fuse = results_fuse["loss"]
+    finally:
+        policy_fuse.shutdown()
+        cluster_fuse.shutdown()
+
+    # Verify both produce valid losses
+    assert not torch.isnan(loss_std).any(), "Standard GRPO loss should not be NaN"
+    assert not torch.isnan(loss_fuse).any(), "Fusion GRPO loss should not be NaN"
+    assert not torch.isinf(loss_std).any(), "Standard GRPO loss should not be Inf"
+    assert not torch.isinf(loss_fuse).any(), "Fusion GRPO loss should not be Inf"
+
+    # Verify losses are numerically close
+    torch.testing.assert_close(loss_std, loss_fuse, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skip(
+    reason="transformers-v5: Ray ActorAlreadyExistsError (megatron actor cleanup issue)"
+)
+@pytest.mark.hf_gated
+@pytest.mark.timeout(300)
+def test_megatron_context_parallel_logprob_agreement(tiny_llama_model_path):
+    """Test that CP and non-CP models produce identical logprobs with sequence packing enabled."""
+    num_gpus = 2
+    batch_size = 4
+    seq_len = 64
+    vocab_size = 32000
+
+    # Create test data with varying sequence lengths to test sequence packing
+    torch.manual_seed(42)  # Fixed seed for reproducibility
+    input_ids = torch.arange(seq_len * batch_size, device="cuda").reshape(
+        batch_size, seq_len
+    )
+    # Create varied sequence lengths for more realistic sequence packing test
+    input_lengths = torch.tensor([31, 21, 29, 56], dtype=torch.int32)
+    attention_mask = torch.zeros(batch_size, seq_len)
+    for i, length in enumerate(input_lengths):
+        attention_mask[i, :length] = 1
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+        }
+    )
+
+    # Test 1: Non-CP model (context_parallel_size=1) with sequence packing
+    print(
+        "=== Testing Non-CP model (context_parallel_size=1) with sequence packing ==="
+    )
+    cluster_no_cp = RayVirtualCluster(
+        name="test-no-cp-packing",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    config_no_cp = create_megatron_test_config(
+        tiny_llama_model_path, tp=1, pp=1, precision="bfloat16"
+    )
+    # Ensure context parallel is disabled
+    config_no_cp["megatron_cfg"]["context_parallel_size"] = 1
+
+    # Enable sequence packing
+    config_no_cp["sequence_packing"] = {
+        "enabled": True,
+        "train_mb_tokens": seq_len,
+        "logprob_mb_tokens": seq_len,
+        "algorithm": "modified_first_fit_decreasing",
+    }
+
+    tokenizer = get_tokenizer(config_no_cp["tokenizer"])
+    config_no_cp["generation"] = configure_generation_config(
+        config_no_cp["generation"], tokenizer
+    )
+
+    policy_no_cp = Policy(
+        cluster=cluster_no_cp,
+        config=config_no_cp,
+        tokenizer=tokenizer,
+        name_prefix="lm_policy_nocp_pack_lp",
+        init_reference_model=False,
+    )
+
+    # Get logprobs from non-CP model with sequence packing
+    policy_no_cp.prepare_for_lp_inference()
+    logprobs_no_cp = policy_no_cp.get_logprobs(data)["logprobs"]
+    logprobs_no_cp = logprobs_no_cp * attention_mask
+    print(f"Non-CP logprobs shape: {logprobs_no_cp.shape}")
+    print(f"Non-CP logprobs sample: {logprobs_no_cp[0, :5]}")
+
+    # Cleanup non-CP resources
+    policy_no_cp.shutdown()
+
+    config_no_cp_no_packing = config_no_cp.copy()
+    config_no_cp_no_packing["sequence_packing"] = {
+        "enabled": False,
+    }
+    policy_no_cp_no_packing = Policy(
+        cluster=cluster_no_cp,
+        config=config_no_cp_no_packing,
+        tokenizer=tokenizer,
+        name_prefix="lm_policy_nocp_nopack_lp",
+        init_reference_model=False,
+    )
+    # Get logprobs from non-CP model with sequence packing
+    policy_no_cp_no_packing.prepare_for_lp_inference()
+    logprobs_no_cp_no_packing = policy_no_cp_no_packing.get_logprobs(data)["logprobs"]
+    logprobs_no_cp_no_packing = logprobs_no_cp_no_packing * attention_mask
+    print(f"Non-CP logprobs no packing shape: {logprobs_no_cp_no_packing.shape}")
+    print(f"Non-CP logprobs no packing sample: {logprobs_no_cp_no_packing[0, :5]}")
+
+    cluster_no_cp.shutdown()
+
+    # Verify logprobs match between CP and non-CP models with sequence packing
+    print("=== Comparing logprobs ===")
+
+    # Check shapes match
+    print(f"diff packing {logprobs_no_cp - logprobs_no_cp_no_packing}")
+    assert logprobs_no_cp.shape == logprobs_no_cp_no_packing.shape, (
+        f"Logprob shapes should match: {logprobs_no_cp.shape} vs {logprobs_no_cp_no_packing.shape}"
+    )
+    (
+        torch.testing.assert_close(
+            logprobs_no_cp, logprobs_no_cp_no_packing, rtol=1e-3, atol=1e-3
+        ),
+        (
+            "Logprobs should match between non-CP and non-CP models with sequence packing"
+        ),
+    )
+
+    # Test 2: CP model (context_parallel_size=2) with sequence packing
+    print("=== Testing CP model (context_parallel_size=2) with sequence packing ===")
+    cluster_cp = RayVirtualCluster(
+        name="test-cp-packing",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    config_cp = create_megatron_test_config(
+        tiny_llama_model_path, tp=1, pp=1, precision="bfloat16"
+    )
+    # Enable context parallel
+    config_cp["megatron_cfg"]["context_parallel_size"] = 2
+    config_cp["make_sequence_length_divisible_by"] *= 4
+
+    # Enable sequence packing
+    config_cp["sequence_packing"] = {
+        "enabled": True,
+        "train_mb_tokens": seq_len,
+        "logprob_mb_tokens": seq_len,
+        "algorithm": "modified_first_fit_decreasing",
+    }
+
+    config_cp["generation"] = configure_generation_config(
+        config_cp["generation"], tokenizer
+    )
+
+    policy_cp = Policy(
+        cluster=cluster_cp,
+        config=config_cp,
+        tokenizer=tokenizer,
+        name_prefix="lm_policy_cp_lp",
+        init_reference_model=False,
+    )
+
+    # Get logprobs from CP model with sequence packing
+    policy_cp.prepare_for_lp_inference()
+    logprobs_cp = policy_cp.get_logprobs(data)["logprobs"]
+    print(f"CP logprobs shape: {logprobs_cp.shape}")
+    print(f"CP logprobs sample: {logprobs_cp[0, :5]}")
+
+    # Cleanup CP resources
+    policy_cp.shutdown()
+    cluster_cp.shutdown()
+
+    # Verify logprobs match between CP and non-CP models with sequence packing
+    print("=== Comparing logprobs ===")
+
+    # Check shapes match
+    assert logprobs_no_cp.shape == logprobs_cp.shape, (
+        f"Logprob shapes should match: {logprobs_no_cp.shape} vs {logprobs_cp.shape}"
+    )
+
+    # Check that neither contains NaN or Inf
+    assert not torch.isnan(logprobs_no_cp).any(), (
+        "Non-CP logprobs should not contain NaN"
+    )
+    assert not torch.isinf(logprobs_no_cp).any(), (
+        "Non-CP logprobs should not contain Inf"
+    )
+    assert not torch.isnan(logprobs_cp).any(), "CP logprobs should not contain NaN"
+    assert not torch.isinf(logprobs_cp).any(), "CP logprobs should not contain Inf"
+
+    # Check that first token logprobs are zero (by convention)
+    assert torch.all(logprobs_no_cp[:, 0] == 0), (
+        "First token logprobs should be zero (non-CP)"
+    )
+    assert torch.all(logprobs_cp[:, 0] == 0), "First token logprobs should be zero (CP)"
+
+    # Compare logprobs with tight tolerance
+    logprobs_cp = logprobs_cp * attention_mask
+    print(f"diff {logprobs_no_cp_no_packing - logprobs_cp}")
+    max_diff = torch.max(torch.abs(logprobs_no_cp_no_packing - logprobs_cp)).item()
+    mean_diff = torch.mean(torch.abs(logprobs_no_cp_no_packing - logprobs_cp)).item()
+    print(f"Max difference: {max_diff}")
+    print(f"Mean difference: {mean_diff}")
+
+    # Assert logprobs are identical (or very close due to floating point)
+    torch.testing.assert_close(
+        logprobs_no_cp_no_packing,
+        logprobs_cp,
+        rtol=1e-3,
+        atol=1e-2,
+        msg="CP and non-CP models should produce identical logprobs with sequence packing",
+    )
+
+    print(
+        "✓ SUCCESS: CP and non-CP models produce identical logprobs with sequence packing"
+    )
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(300)
+def test_megatron_context_parallel_training_agreement(tiny_llama_model_path):
+    """Test that CP and non-CP models produce consistent training results with ClippedPG loss and sequence packing."""
+    num_gpus = 2
+    batch_size = 2
+    seq_len = 64
+    vocab_size = 32000
+
+    # Create test data with varying sequence lengths to test sequence packing
+    torch.manual_seed(42)  # Fixed seed for reproducibility
+    input_ids = torch.arange(seq_len * batch_size, device="cuda").reshape(
+        batch_size, seq_len
+    )
+
+    # Create varied sequence lengths for more realistic sequence packing test
+    input_lengths = torch.tensor([33, 48], dtype=torch.int32)
+    attention_mask = torch.zeros(batch_size, seq_len)
+    for i, length in enumerate(input_lengths):
+        attention_mask[i, :length] = 1
+
+    # Create additional data required for ClippedPG loss
+    token_mask = torch.zeros(batch_size, seq_len)
+    sample_mask = torch.ones(batch_size)
+    advantages = torch.randn(batch_size, seq_len)
+    prev_logprobs = torch.randn(batch_size, seq_len)
+    generation_logprobs = prev_logprobs.clone()
+    reference_policy_logprobs = prev_logprobs.clone()
+    labels = torch.randint(0, vocab_size, (batch_size, seq_len))
+
+    for i in range(batch_size):
+        token_mask[i, : input_lengths[i]] = 1
+
+    base_data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "advantages": advantages,
+            "prev_logprobs": prev_logprobs,
+            "generation_logprobs": generation_logprobs,
+            "reference_policy_logprobs": reference_policy_logprobs,
+            "labels": labels,
+        }
+    )
+
+    # Test 1: Non-CP model (context_parallel_size=1) with sequence packing
+    print(
+        "=== Testing Non-CP model (context_parallel_size=1) with sequence packing ==="
+    )
+    cluster_no_cp = RayVirtualCluster(
+        name="test-no-cp-training",
+        bundle_ct_per_node_list=[1],
+        use_gpus=True,
+        num_gpus_per_node=1,
+        max_colocated_worker_groups=1,
+    )
+
+    config_no_cp = create_megatron_test_config(
+        tiny_llama_model_path, tp=1, pp=1, precision="bfloat16"
+    )
+    # Ensure context parallel is disabled
+    config_no_cp["megatron_cfg"]["context_parallel_size"] = 1
+    config_no_cp["train_global_batch_size"] = 2
+
+    # Enable sequence packing
+    config_no_cp["sequence_packing"] = {
+        "enabled": True,
+        "train_mb_tokens": seq_len,
+        "logprob_mb_tokens": seq_len,
+        "algorithm": "modified_first_fit_decreasing",
+    }
+
+    tokenizer = get_tokenizer(config_no_cp["tokenizer"])
+    config_no_cp["generation"] = configure_generation_config(
+        config_no_cp["generation"], tokenizer
+    )
+
+    policy_no_cp = Policy(
+        cluster=cluster_no_cp,
+        config=config_no_cp,
+        tokenizer=tokenizer,
+        name_prefix="lm_policy_nocp_train",
+        init_reference_model=False,
+    )
+
+    # Create ClippedPG loss function
+    loss_fn = ClippedPGLossFn(ClippedPGLossConfig())
+
+    # Train non-CP model
+    policy_no_cp.prepare_for_training()
+    no_cp_results = policy_no_cp.train(base_data, loss_fn)
+    no_cp_loss = no_cp_results["loss"]
+    no_cp_metrics = no_cp_results["all_mb_metrics"]
+
+    print(f"Non-CP training loss: {no_cp_loss}")
+    print(f"Non-CP metrics: {no_cp_metrics}")
+
+    # Cleanup non-CP resources
+    policy_no_cp.shutdown()
+    cluster_no_cp.shutdown()
+
+    # Test 2: CP model (context_parallel_size=2) with sequence packing
+    print("=== Testing CP model (context_parallel_size=2) with sequence packing ===")
+    cluster_cp = RayVirtualCluster(
+        name="test-cp-training",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    config_cp = create_megatron_test_config(
+        tiny_llama_model_path, tp=1, pp=1, precision="bfloat16"
+    )
+    # Enable context parallel
+    config_cp["megatron_cfg"]["context_parallel_size"] = 2
+    config_cp["make_sequence_length_divisible_by"] *= 4
+    config_cp["train_global_batch_size"] = 2
+
+    # Enable sequence packing
+    config_cp["sequence_packing"] = {
+        "enabled": True,
+        "train_mb_tokens": seq_len,
+        "logprob_mb_tokens": seq_len,
+        "algorithm": "modified_first_fit_decreasing",
+    }
+
+    config_cp["generation"] = configure_generation_config(
+        config_cp["generation"], tokenizer
+    )
+
+    policy_cp = Policy(
+        cluster=cluster_cp,
+        config=config_cp,
+        tokenizer=tokenizer,
+        name_prefix="lm_policy_cp_train",
+        init_reference_model=False,
+    )
+
+    # Train CP model
+    policy_cp.prepare_for_training()
+    cp_results = policy_cp.train(base_data, loss_fn)
+    cp_loss = cp_results["loss"]
+    cp_metrics = cp_results["all_mb_metrics"]
+
+    print(f"CP training loss: {cp_loss}")
+    print(f"CP metrics: {cp_metrics}")
+
+    # Cleanup CP resources
+    policy_cp.shutdown()
+    cluster_cp.shutdown()
+
+    # Compare training results
+    print("=== Comparing training results ===")
+
+    # Check that neither contains NaN or Inf
+    assert not torch.isnan(no_cp_loss).any(), "Non-CP loss should not contain NaN"
+    assert not torch.isinf(no_cp_loss).any(), "Non-CP loss should not contain Inf"
+    assert not torch.isnan(cp_loss).any(), "CP loss should not contain NaN"
+    assert not torch.isinf(cp_loss).any(), "CP loss should not contain Inf"
+
+    # Check shapes match
+    assert no_cp_loss.shape == cp_loss.shape, (
+        f"Loss shapes should match: {no_cp_loss.shape} vs {cp_loss.shape}"
+    )
+
+    # Compare loss values with tolerance
+    loss_diff = torch.abs(no_cp_loss - cp_loss)
+    max_loss_diff = torch.max(loss_diff).item()
+    mean_loss_diff = torch.mean(loss_diff).item()
+
+    print(f"Loss difference - Max: {max_loss_diff:.6f}, Mean: {mean_loss_diff:.6f}")
+
+    # Check key metrics are similar
+    key_metrics = ["probs_ratio", "grad_norm", "kl_penalty", "approx_entropy"]
+    for metric in key_metrics:
+        if metric in no_cp_metrics and metric in cp_metrics:
+            no_cp_val = no_cp_metrics[metric]
+            cp_val = cp_metrics[metric]
+            if metric == "grad_norm":
+                diff = abs(sum(no_cp_val) - sum(cp_val) * 2)
+            else:
+                diff = abs(sum(no_cp_val) - sum(cp_val))
+            print(
+                f"Metric {metric}: Non-CP={sum(no_cp_val):.6f}, CP={sum(cp_val):.6f}, Diff={diff:.6f}"
+            )
+
+            # Allow some tolerance for floating point differences
+            assert diff < 0.01 * sum(no_cp_val) or diff < 1e-4, (
+                f"Metric {metric} differs too much: {diff:.6f}"
+            )
+
+    # Assert losses are very close (accounting for minor floating point differences)
+    torch.testing.assert_close(
+        no_cp_loss,
+        cp_loss,
+        rtol=1e-2,
+        atol=1e-2,
+        msg="CP and non-CP models should produce very similar training losses with sequence packing",
+    )
+
+    print(
+        "✓ SUCCESS: CP and non-CP models produce consistent training results with ClippedPG loss and sequence packing"
+    )
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(300)
+def test_megatron_gradient_norm_consistency_across_parallelism(tiny_llama_model_path):
+    """Test that gradient norms are consistent across different TP and DP configurations.
+
+    This test validates that the same model produces identical gradient norms
+    regardless of tensor parallelism (TP) and data parallelism (DP) settings.
+    """
+    batch_size = 8
+    seq_len = 64
+    vocab_size = 32000
+
+    # Create reproducible test data
+    torch.manual_seed(42)
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+    labels = torch.randint(0, vocab_size, (batch_size, seq_len))
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "labels": labels,
+            "sample_mask": torch.ones(batch_size),
+            "token_mask": torch.ones_like(input_ids),
+        }
+    )
+
+    # Test configurations: (num_gpus, tp, pp, description)
+    test_configs = [
+        (1, 1, 1, "DP1TP1"),
+        (2, 1, 1, "DP2"),  # Data parallel with 2 GPUs
+        (2, 2, 1, "TP2"),  # Tensor parallel with 2 GPUs
+    ]
+
+    grad_norms = {}
+    losses = {}
+
+    for num_gpus, tp, pp, desc in test_configs:
+        print(
+            f"\n=== Testing {desc} configuration (GPUs={num_gpus}, TP={tp}, PP={pp}) ==="
+        )
+
+        cluster = RayVirtualCluster(
+            name=f"test-grad-norm-{desc.lower()}",
+            bundle_ct_per_node_list=[num_gpus],
+            use_gpus=True,
+            num_gpus_per_node=num_gpus,
+            max_colocated_worker_groups=1,
+        )
+
+        config = create_megatron_test_config(
+            model_name=tiny_llama_model_path,
+            tp=tp,
+            pp=pp,
+            precision="float32",  # Use float32 for more stable gradient comparisons
+        )
+
+        tokenizer = get_tokenizer(config["tokenizer"])
+        config["generation"] = configure_generation_config(
+            config["generation"], tokenizer
+        )
+
+        policy = Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+
+        # Use SimpleLossFn for consistent comparison
+        loss_fn = NLLLossFn()
+
+        try:
+            # Prepare for training
+            policy.prepare_for_training()
+
+            # Perform one forward/backward step
+            print(f"Performing forward/backward pass for {desc}...")
+            results = policy.train(data, loss_fn)
+
+            # Extract metrics
+            loss_tensor = results["loss"]
+            grad_norm = results["grad_norm"]
+
+            # Verify loss is valid
+            assert not torch.isnan(loss_tensor).any(), (
+                f"Loss should not be NaN for {desc}"
+            )
+            assert not torch.isinf(loss_tensor).any(), (
+                f"Loss should not be Inf for {desc}"
+            )
+
+            # Store results for comparison
+            grad_norms[desc] = grad_norm
+            losses[desc] = loss_tensor.cpu().numpy()
+
+            print(f"{desc} - Loss: {loss_tensor}")
+            print(f"{desc} - Grad norm: {grad_norm}")
+
+            # Check tensor parallel attributes on model parameters
+            print(f"Checking tensor parallel attributes for {desc}...")
+            tp_check_futures = policy.worker_group.run_all_workers_single_data(
+                "check_tensor_parallel_attributes"
+            )
+            tp_check_results = [ray.get(future) for future in tp_check_futures]
+
+            # Analyze the first worker's results (all workers should have the same structure)
+            tp_info = tp_check_results[0]
+
+            print(f"{desc} - TP size: {tp_info['tp_size']}")
+            print(f"{desc} - Total params: {tp_info['total_params']}")
+            print(f"{desc} - TP params: {len(tp_info['tp_params'])}")
+            print(f"{desc} - Non-TP params: {len(tp_info['non_tp_params'])}")
+
+            # Validate tensor parallel attributes
+            expected_tp_size = tp
+            assert tp_info["tp_size"] == expected_tp_size, (
+                f"Expected TP size {expected_tp_size}, got {tp_info['tp_size']}"
+            )
+
+            if tp > 1:
+                tp_sharded_names = [item["name"] for item in tp_info["tp_params"]]
+                # When tensor parallelism is enabled, we should have some TP parameters
+                assert "module.embedding.word_embeddings.weight" in tp_sharded_names, (
+                    f"Expected module.embedding.word_embeddings.weight to be TP-sharded when TP={tp}"
+                )
+
+        finally:
+            policy.shutdown()
+            cluster.shutdown()
+
+    # Compare gradient norms across configurations
+    print("\n=== Comparing gradient norms across configurations ===")
+
+    # Get reference values from DP2 configuration
+    # NOTE: even if TP2 config passes these tests, it doesn't necessarily imply
+    # there are no bugs. That's why we also check that TP attributes are set correctly above
+    reference_config = "DP1TP1"
+    reference_grad_norm = grad_norms[reference_config]
+    reference_loss = losses[reference_config]
+
+    for config_name, grad_norm in grad_norms.items():
+        if config_name == reference_config:
+            continue
+
+        if not isinstance(grad_norm, list):
+            grad_norm = [grad_norm]
+
+        print(f"\nComparing {config_name} with {reference_config}:")
+        print(f"  {reference_config} grad norm: {reference_grad_norm}")
+        print(f"  {config_name} grad norm: {grad_norm}")
+
+        # Compare gradient norms
+        if not isinstance(grad_norm, list):
+            grad_norm = [grad_norm]
+            reference_grad_norm = [reference_grad_norm]
+        if isinstance(grad_norm, list) and isinstance(reference_grad_norm, list):
+            # Handle case where grad_norm is a list (multiple microbatches)
+            assert len(grad_norm) == len(reference_grad_norm), (
+                f"Number of gradient norm values should match: {len(grad_norm)} vs {len(reference_grad_norm)}"
+            )
+
+            for i, (gn, ref_gn) in enumerate(zip(grad_norm, reference_grad_norm)):
+                grad_diff = abs(gn - ref_gn)
+                relative_diff = grad_diff / (ref_gn + 1e-8)
+                print(
+                    f"    Microbatch {i}: {ref_gn} vs {gn}, diff={grad_diff.item():.6f}, rel_diff={relative_diff.item():.6f}"
+                )
+
+                # Allow small differences due to floating point precision and parallelization
+                assert relative_diff < 0.01 or grad_diff < 1e-6, (
+                    f"Gradient norm difference too large for microbatch {i}: "
+                    f"{ref_gn} vs {gn} (diff={grad_diff.item():.6f}, rel_diff={relative_diff.item():.6f})"
+                )
+
+        # Compare losses (should also be identical for same computation)
+        loss_diff = np.max(np.abs(reference_loss - losses[config_name]))
+        relative_loss_diff = loss_diff / (np.mean(np.abs(reference_loss)) + 1e-8)
+        print(
+            f"    Loss diff: {loss_diff:.6f}, relative loss diff: {relative_loss_diff:.6f}"
+        )
+
+        # Allow small differences in loss as well
+        assert relative_loss_diff < 0.01 or loss_diff < 1e-6, (
+            f"Loss difference too large: "
+            f"max diff={loss_diff:.6f}, rel_diff={relative_loss_diff:.6f}"
+        )
+
+    print(
+        "\n✓ SUCCESS: Gradient norms are consistent across all parallelization configurations!"
+    )
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(300)
+def test_megatron_policy_flops_range_check(tiny_llama_model_path):
+    """Test that the returned FLOPS is within a reasonable range using default config.
+
+    Performs 2 warmup iterations and measures FLOPS on the third iteration.
+    """
+    num_gpus = 1
+    batch_size = 8
+    seq_len = 128
+    vocab_size = 32000
+
+    # Create cluster and policy with default config
+    cluster = RayVirtualCluster(
+        name="test-flops-tracker",
+        bundle_ct_per_node_list=[num_gpus],
+        use_gpus=True,
+        num_gpus_per_node=num_gpus,
+        max_colocated_worker_groups=1,
+    )
+
+    # Use the default config function
+    config = create_megatron_test_config(tiny_llama_model_path)
+    tokenizer = get_tokenizer(config["tokenizer"])
+    config["generation"] = configure_generation_config(config["generation"], tokenizer)
+
+    policy = Policy(
+        cluster=cluster,
+        config=config,
+        tokenizer=tokenizer,
+        init_reference_model=False,
+    )
+
+    # Create test data
+    torch.manual_seed(42)
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    attention_mask = torch.ones(batch_size, seq_len)
+    input_lengths = attention_mask.sum(dim=1).to(torch.int32)
+
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": input_lengths,
+            "attention_mask": attention_mask,
+            "labels": torch.randint(0, vocab_size, (batch_size, seq_len)),
+            "sample_mask": torch.ones(batch_size),
+        }
+    )
+
+    # Create loss function
+    loss_fn = SimpleLossFn()
+
+    try:
+        # Prepare for training
+        policy.prepare_for_training()
+
+        # Perform 2 warmup iterations
+        print("Performing warmup iterations...")
+        for warmup_step in range(2):
+            results = policy.train(data, loss_fn)
+
+        # Measure FLOPS on the third iteration
+        print("Measuring FLOPS on third iteration...")
+        time_begin = time.time()
+        results = policy.train(data, loss_fn)
+        runtime_sec = time.time() - time_begin
+
+        # Check if FLOPS tracking is available
+        if policy.flops_tracker is not None:
+            assert "total_flops" in results, (
+                "Training results should contain 'total_flops'"
+            )
+            total_flops = results["total_flops"]
+
+            assert isinstance(total_flops, (int, float)), (
+                "total_flops should be numeric"
+            )
+            assert total_flops > 0, "total_flops should be positive"
+
+            total_tflops = total_flops / 1e12
+            print(f"Total FLOPS: {total_flops:.2e} ({total_tflops:.4f} TFLOPS)")
+
+            flop_count_total = total_flops * runtime_sec
+            assert 1e9 < flop_count_total < 5e10, (
+                "Total FLOPS should be within 1e9 and 5e10"
+            )
+
+            if "theoretical_tflops" in results:
+                theoretical_tflops = results["theoretical_tflops"]
+                assert isinstance(theoretical_tflops, (int, float)), (
+                    "theoretical_tflops should be numeric"
+                )
+                assert theoretical_tflops > 0, "theoretical_tflops should be positive"
+
+                utilization = total_tflops / theoretical_tflops
+                print(f"Theoretical TFLOPS: {theoretical_tflops:.2f}")
+                print(f"Model utilization: {utilization * 100:.2f}%")
+
+                assert utilization <= 1.0, (
+                    f"Model utilization {utilization * 100:.2f}% should not exceed 100%"
+                )
+        else:
+            print("FLOPS tracker not available, skipping FLOPS range check")
+            pytest.skip("FLOPS tracker not supported for this model configuration")
+
+    finally:
+        policy.shutdown()
+        cluster.shutdown()

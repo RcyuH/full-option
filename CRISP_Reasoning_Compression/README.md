@@ -1,0 +1,300 @@
+# CRISP: Compressed Reasoning via Iterative Self-Policy Distillation (Original OPSDC On-Policy Self-Distillation for Reasoning Compression)
+
+This repository contains the code for **CRISP** (**C**ompressed **R**easoning via **I**terative **S**elf-**P**olicy Distillation), a method that teaches reasoning models to think more concisely by distilling their own concise behavior back into themselves.
+
+**Paper:** [CRISP: Compressed Reasoning via Iterative Self-Policy Distillation](crisp_compressed_reasoning_via_iterative_self_policy_distillation.pdf) | [arXiv](https://arxiv.org/abs/2603.05433)
+
+**Authors:** Hejian Sang\*, Yuanda Xu\*, Zhengze Zhou\*, Ran He\*, Zhipeng Wang, Jiachen Sun
+
+**Related write-up:** [Scorer Choice in Math Reasoning Evaluation](https://zhengzezhou.github.io/math-scorer-choice/) — a four-policy decomposition of how verifier choice (answer-extraction vs. symbolic equivalence) can swing reported MATH-500 accuracy by up to ~80 percentage points on identical generations.
+
+## New Experiment Development: Miles
+
+New OPSD experiments use the vendored [Miles source](miles/) in this repository.
+Make code changes directly under `miles/`; the files are tracked by CRISP as
+ordinary source. The initial import is pinned to upstream commit
+`b24cfa34b94a53a26edcb5dd0e8d9a16868505fa`, recorded in
+[CRISP_UPSTREAM.json](miles/CRISP_UPSTREAM.json), with its license and notices
+preserved. Read the [HTML development guide](docs/miles-development.html) for
+the code layout and workflow.
+
+The [OPSD implementation and reference-validation design](docs/opsd-implementation-design.html)
+records the implemented full-vocabulary loss, fixed-base Megatron teacher, paired
+token prefixes and canonical LoRA path. Independent author-loss tests, a ten-step
+HF replay, tiny Megatron TP1/TP2 checks, and the bounded 4B live pilot pass. The
+linked HTML report separates those results from mapped update parity and learning
+evaluation. The [four-arm experiment report](docs/two-node-experiment-plan.html)
+records the completed full-parameter two-block comparison and its limitations.
+The [PI-then-distillation follow-up proposal](docs/pi-distillation-followup-plan.html)
+adds independent warm-up replication, mechanism controls and cross-model/domain
+validation; it requires review before new GPU experiments.
+
+Run Miles commands from the `miles/` working directory. The existing `workspace/`
+implementation and paper results below describe the original CRISP pipeline.
+The new experiment protocol is pending review; no training is launched by this
+source import.
+
+## Key Idea
+
+Reasoning models think out loud, but much of what they say is noise. CRISP uses a single, almost trivial idea: *ask the model to be concise, then teach it to do so without being asked*.
+
+- **Teacher**: The same model conditioned on a conciseness instruction (e.g., "Solve concisely, avoid unnecessary steps")
+- **Student**: The same model without the conciseness instruction
+
+Training generates student rollouts and minimizes per-token reverse KL divergence between student and teacher distributions. No ground-truth answers, no token budgets, no difficulty estimators.
+
+## Results
+
+All numbers are mean@8 under a 30K-token budget, scored with a dual-path grader (`Answer:` line **or** `\boxed{}`, math-verified). We use two conciseness instructions: **v1** (uniform "be concise") compresses more aggressively, while **v2** (difficulty-aware) better preserves accuracy on hard problems. Reduction is relative to the base model's average response length.
+
+### MATH-500 (in-domain, easiest)
+
+| Model | Base acc | v2 acc / reduction | v1 acc / reduction |
+|-------|:--------:|:------------------:|:------------------:|
+| Qwen3-8B  | 95.7 | 95.7 / 32% | 95.7 / 57% |
+| Qwen3-14B | 93.0 | 95.2 / 35% | 96.3 / 56% |
+| Qwen3-32B | 95.6 | 96.0 / 30% | 94.3 / 51% |
+| DeepSeek-R1-Distill-Llama-8B | 71.3 | 79.8 / 23% | 82.1 / 32% |
+
+### AIME 2024 (in-domain, harder)
+
+| Model | Base acc | v2 acc / reduction | v1 acc / reduction |
+|-------|:--------:|:------------------:|:------------------:|
+| Qwen3-8B  | 76.2 | 75.0 / 17% | 72.9 / 33% |
+| Qwen3-14B | 75.0 | 75.0 / 20% | 73.8 / 38% |
+| Qwen3-32B | 80.5 | 80.4 / 19% | 72.9 / 30% |
+| DeepSeek-R1-Distill-Llama-8B | 33.3 | 42.1 / −3% | 39.2 / 6% |
+
+**Takeaways:**
+- **Compression with preserved accuracy.** CRISP shortens reasoning by up to ~57% on MATH-500 while holding accuracy, and improves it where the base model has room (Qwen3-14B +3.3 pts on MATH-500; DeepSeek-R1-Distill-Llama-8B +10.8 pts).
+- **Difficulty-adaptive.** Reductions are largest on the easier MATH-500 and smaller on the harder AIME benchmarks — the KL objective compresses easy problems more, with no explicit difficulty estimation.
+- **Instruction-agnostic.** The effect does not depend on a single hand-tuned prompt: v1 trades more compression for a small accuracy cost, v2 protects hard problems; both compress strongly while preserving accuracy.
+- **General capabilities and entropy preserved.** Out-of-domain accuracy on GPQA-Diamond and MMLU stays within ~1 point of the base model, and the student's policy entropy is stable throughout training (no entropy collapse).
+
+## Model Checkpoints
+
+All trained CRISP checkpoints are on the Hugging Face Hub: [huggingface.co/pb09204048](https://huggingface.co/pb09204048/models). Each model is released in two variants — **v1** (uniform concise prompt, more aggressive compression) and **v2** (difficulty-aware prompt, better accuracy on hard problems). The `pb09204048/CRISP` repo holds the DAPO-Math training prompts (v1/v2 conciseness columns).
+
+| Base model | v1 (uniform) | v2 (difficulty-aware) |
+|------------|--------------|-----------------------|
+| Qwen3-8B  | [CRISP-Qwen3-8B-v1](https://huggingface.co/pb09204048/CRISP-Qwen3-8B-v1) | [CRISP-Qwen3-8B-v2](https://huggingface.co/pb09204048/CRISP-Qwen3-8B-v2) |
+| Qwen3-14B | [CRISP-Qwen3-14B-v1](https://huggingface.co/pb09204048/CRISP-Qwen3-14B-v1) | [CRISP-Qwen3-14B-v2](https://huggingface.co/pb09204048/CRISP-Qwen3-14B-v2) |
+| DeepSeek-R1-Distill-Llama-8B | [CRISP-DeepSeek-R1-Distill-Llama-8B-v1](https://huggingface.co/pb09204048/CRISP-DeepSeek-R1-Distill-Llama-8B-v1) | [CRISP-DeepSeek-R1-Distill-Llama-8B-v2](https://huggingface.co/pb09204048/CRISP-DeepSeek-R1-Distill-Llama-8B-v2) |
+
+Load any checkpoint directly with `transformers` and generate as usual (the models emit an `Answer:` line and, on Qwen3, a `<think>...</think>` trace):
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model_id = "pb09204048/CRISP-Qwen3-8B-v2"
+tok = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype="auto", device_map="auto")
+
+prompt = "Find all real numbers x such that x^3 - 6x^2 + 11x - 6 = 0.\n\nRemember to put your answer on its own line after \"Answer:\"."
+messages = [{"role": "user", "content": prompt}]
+inputs = tok.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt").to(model.device)
+out = model.generate(inputs, max_new_tokens=30000, temperature=0.6, top_p=0.95, top_k=20)
+print(tok.decode(out[0][inputs.shape[1]:], skip_special_tokens=True))
+```
+
+To reproduce the paper numbers, evaluate each checkpoint against its base model on MATH-500 / AIME with the dual-path grader (`Answer:` line **or** `\boxed{}`), mean@8, 30K-token budget — comparing the CRISP checkpoint's accuracy and average response length to the base model quantifies the accuracy change and token reduction reported above.
+
+## Repository Structure
+
+```
+CRISP_Reasoning_Compression/
+├── miles/                         # Vendored Miles for new OPSD experiments
+├── docs/                          # HTML development documentation
+├── workspace/
+│   ├── config/
+│   │   └── prompts.json           # Prompt templates (student, teacher, length prune)
+│   ├── data/
+│   │   ├── DAPO-Math-17k-dedup/   # Training data (17k math problems)
+│   │   ├── MATH-500/              # Validation benchmark
+│   │   ├── aime24/                # AIME 2024 validation
+│   │   └── aime25/                # AIME 2025 validation
+│   ├── src/
+│   │   ├── data/
+│   │   │   ├── process_eval_data.py          # Process eval datasets (train/val splits)
+│   │   │   ├── prepare_length_prune_data.py  # Generate length pruning prompts
+│   │   │   └── prepare_self_distill_data.py  # Generate self-distill prompts (with teacher solutions)
+│   │   └── self_distill_hybrid/
+│   │       ├── main_opsd.py       # OPSD entry point
+│   │       ├── opsd_trainer.py    # OPSD trainer (JSD/reverse-KL loss)
+│   │       ├── opsd_worker.py     # OPSD FSDP worker
+│   │       ├── sd_worker.py       # Base self-distill worker
+│   │       ├── sd_dataset.py      # Dataset for paired teacher/student prompts
+│   │       └── sd_verifier.py     # Math answer verification
+│   ├── scripts/sft/
+│   │   └── train_opsd.sh          # Main training launch script
+│   └── execution-configs/         # Hyperparameter configs for Qwen3-8B and 14B
+```
+
+## Original Paper Pipeline Setup
+
+### Prerequisites
+
+- 8x H100/H200 GPUs (80GB)
+- Python 3.10+
+- CUDA 12.4+
+
+### Installation
+
+The original pipeline assumes a compatible VERL checkout at `./verl`; that
+dependency is not vendored in this repository. For new experiments, use the
+[Miles development guide](docs/miles-development.html) instead.
+
+```bash
+git clone https://github.com/HJSang/CRISP_Reasoning_Compression.git
+cd CRISP_Reasoning_Compression
+
+# Install VERL and dependencies
+cd verl
+pip install -e .
+cd ..
+
+# Install additional dependencies
+pip install sglang pandas datasets hydra-core omegaconf
+```
+
+## Quick Start
+
+The full pipeline has 3 stages:
+
+### Stage 1: Process Evaluation Data
+
+Process DAPO-Math-17k-dedup into train/val splits and prepare validation benchmarks (MATH-500, AIME 2024, AIME 2025).
+
+```bash
+cd workspace/src/data
+
+python process_eval_data.py \
+    --data_dir ../../data \
+    --output_dir ../../data/processed
+```
+
+This produces:
+- `data/processed/train.parquet` — DAPO training split (95%)
+- `data/processed/val_dapo.parquet` — DAPO validation split (5%)
+- `data/processed/val_math500.parquet`, `val_aime24.parquet`, `val_aime25.parquet` — Evaluation benchmarks
+
+### Stage 2: Generate Length Pruning Prompts
+
+Create paired teacher/student prompts for OPSD training. The teacher prompt adds a conciseness instruction; the student prompt is the original DAPO-Math prompt unchanged.
+
+```bash
+# Batch mode (recommended) — generates all 4 variants with shared 80/20 split:
+python prepare_length_prune_data.py batch \
+    --input-parquet ../../data/DAPO-Math-17k-dedup/distinct-prompts-with-rewards.parquet \
+    --output-root ../../data
+
+# This creates:
+#   data/length_prune_concise/     — "Solve concisely" teacher prompt
+#   data/length_prune_20pct/       — "Use 20% fewer tokens" teacher prompt
+#   data/length_prune_50pct/       — "Use 50% fewer tokens" teacher prompt
+#   data/length_prune_80pct/       — "Use 80% fewer tokens" teacher prompt
+#
+# Each directory contains:
+#   self_distill_prompts.parquet       — Training prompts
+#   self_distill_prompts_val.parquet   — Validation prompts
+```
+
+### Stage 3: Train OPSD
+
+Launch OPSD training using the VERL HybridEngine (sglang for generation + FSDP for training).
+
+#### Qwen3-8B
+
+```bash
+MODEL_PATH=/path/to/Qwen3-8B \
+SD_PROMPTS_PATH=./workspace/data/length_prune_concise/self_distill_prompts.parquet \
+SD_VAL_PROMPTS_PATH=./workspace/data/length_prune_concise/self_distill_prompts_val.parquet \
+OPSD_BETA=0.5 \
+SD_TEMPERATURE=1.0 \
+SD_TOP_P=1.0 \
+SD_MAX_TOKENS=8192 \
+SFT_MAX_LENGTH=10240 \
+TOTAL_EPOCHS=1 \
+TRAIN_BATCH_SIZE=32 \
+MICRO_BATCH_SIZE=2 \
+LEARNING_RATE=1e-6 \
+TP_SIZE=2 \
+GPU_MEM_UTIL=0.75 \
+ULYSSES_SP_SIZE=4 \
+MAX_PROMPT_LENGTH=1024 \
+MAX_RESPONSE_LENGTH=30000 \
+VAL_MAX_TOKENS=30000 \
+CHECK_STRUCTURE=false \
+USE_LIGER=true \
+OPSD_LOSS_TYPE=reverse_kl \
+TEACHER_UPDATE_FREQ=50 \
+EXPERIMENT_NAME=opsd_length_prune_concise \
+bash workspace/scripts/sft/train_opsd.sh
+```
+
+#### Qwen3-14B
+
+```bash
+MODEL_PATH=/path/to/Qwen3-14B \
+SD_PROMPTS_PATH=./workspace/data/length_prune_concise/self_distill_prompts.parquet \
+SD_VAL_PROMPTS_PATH=./workspace/data/length_prune_concise/self_distill_prompts_val.parquet \
+OPSD_BETA=0.5 \
+SD_TEMPERATURE=1.0 \
+SD_TOP_P=1.0 \
+SD_MAX_TOKENS=8192 \
+SFT_MAX_LENGTH=10240 \
+TOTAL_EPOCHS=1 \
+TRAIN_BATCH_SIZE=32 \
+MICRO_BATCH_SIZE=2 \
+LEARNING_RATE=1e-6 \
+TP_SIZE=2 \
+GPU_MEM_UTIL=0.75 \
+ULYSSES_SP_SIZE=4 \
+MAX_PROMPT_LENGTH=1024 \
+MAX_RESPONSE_LENGTH=30000 \
+VAL_MAX_TOKENS=30000 \
+CHECK_STRUCTURE=false \
+USE_LIGER=true \
+OPSD_LOSS_TYPE=reverse_kl \
+TEACHER_UPDATE_FREQ=50 \
+EXPERIMENT_NAME=opsd_length_prune_concise \
+bash workspace/scripts/sft/train_opsd.sh
+```
+
+Pre-configured hyperparameter files for various ablations (teacher update frequency, compression strength) are available in `workspace/execution-configs/`.
+
+## Key Hyperparameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `OPSD_LOSS_TYPE` | `reverse_kl` | Loss type: `reverse_kl` or `jsd` |
+| `OPSD_BETA` | `0.5` | JSD interpolation weight (only used when `jsd`) |
+| `TEACHER_UPDATE_FREQ` | `50` | Steps between teacher weight updates (0 = frozen teacher) |
+| `SD_TEMPERATURE` | `1.0` | Student rollout temperature |
+| `SD_MAX_TOKENS` | `8192` | Max tokens for student generation |
+| `SFT_MAX_LENGTH` | `10240` | Max sequence length for training |
+| `CHECK_STRUCTURE` | `false` | Whether to require `<think>` tags in responses |
+| `USE_LIGER` | `true` | Memory-efficient loss via logsumexp |
+
+## How It Works
+
+1. **Generate**: sglang produces student responses from question-only prompts
+2. **Score**: Teacher forward pass computes logits on student-generated tokens using the conciseness-augmented prompt
+3. **Train**: Minimize per-token reverse KL between student and teacher distributions on ALL responses (no correctness filtering)
+4. **Sync**: Updated weights are automatically synced back to sglang for the next generation step
+5. **Refresh teacher**: Every `TEACHER_UPDATE_FREQ` steps, copy student weights to teacher for progressive compression
+
+## Acknowledgments
+
+Built on top of [VERL](https://github.com/volcengine/verl) (HybridEngine for combined generation and training).
+
+## Citation
+
+```bibtex
+@article{sang2025crisp,
+  title={CRISP: Compressed Reasoning via Iterative Self-Policy Distillation},
+  author={Sang, Hejian and Xu, Yuanda and Zhou, Zhengze and He, Ran and Wang, Zhipeng and Sun, Jiachen},
+  journal={arXiv preprint arXiv:2603.05433},
+  year={2026}
+}
+```

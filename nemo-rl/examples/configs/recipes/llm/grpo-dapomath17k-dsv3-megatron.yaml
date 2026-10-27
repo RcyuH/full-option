@@ -1,0 +1,68 @@
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  max_val_samples: 10000
+loss_fn:
+  use_on_policy_kl_approximation: true
+  use_importance_sampling_correction: true
+checkpointing:
+  checkpoint_dir: results/grpo_dapomath17k_dsv3_megatron
+  keep_top_k: 100
+policy:
+  model_name: "Follow instructions in https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/deepseek.md"
+  train_micro_batch_size: 1
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  max_total_sequence_length: 16384
+  automodel_cfg:
+    enabled: false
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
+    ${mul:2, ${policy.megatron_cfg.context_parallel_size}}}
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+    activation_checkpointing: true
+    tensor_model_parallel_size: 8
+    expert_model_parallel_size: 32
+    pipeline_model_parallel_size: 8
+    num_layers_in_first_pipeline_stage: 7
+    num_layers_in_last_pipeline_stage: 6
+    context_parallel_size: 4
+    sequence_parallel: true
+    apply_rope_fusion: false
+    # HybridEP rather than classic DeepEP: the pinned DeepEP (hybrid-ep branch)
+    # predates DeepEP#564, so its classic cross-node kernels time out under
+    # NVSHMEM >= 3.5.
+    moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    hybridep_num_ranks_per_nvlink_domain: 8
+    hybridep_use_mnnvl: false
+    optimizer:
+      lr: 5.0e-07
+      min_lr: 5.0e-08
+    scheduler:
+      lr_warmup_init: 5.0e-08
+  generation:
+    vllm_cfg:
+      async_engine: true
+      tensor_parallel_size: 32
+    vllm_kwargs:
+      # vLLM 0.20's default FlashInfer TRTLLM MoE backend isn't refit-compatible,
+      # change to triton to keep same behavior as vLLM 0.17.
+      moe_backend: triton
+data:
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+logger:
+  monitor_gpus: false
+  wandb:
+    name: grpo_dapomath17k_1b_megatron
+  mlflow:
+    run_name: grpo_dapomath17k_1b_megatron
+cluster:
+  gpus_per_node: 8
+  num_nodes: 32

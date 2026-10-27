@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+.DS_Store
+/runs/
+/artifacts/
+/checkpoints/
+/wandb/
+.env
+.env.*
+!.env.example
+/private/
+/local/
+/runtime/

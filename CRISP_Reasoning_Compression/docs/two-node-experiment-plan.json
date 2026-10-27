@@ -1,0 +1,2886 @@
+{
+  "schema_version": 15,
+  "status": "r5_two_blocks_training_and_evaluation_complete",
+  "executable": false,
+  "new_gpu_work_authorized": true,
+  "review_required_before_launch": false,
+  "date": "2026-10-09",
+  "supersedes": "historical sampled-token execution draft",
+  "framework": {
+    "name": "Miles",
+    "directory": "miles",
+    "source_baseline": "4f2235868a58305baef3a19a8477279711d57841",
+    "study_changes": "full_parameter_study_with_bounded_stop_and_final_evaluation_drain"
+  },
+  "execution": {
+    "independent_experiments": 1,
+    "experiments_per_node": 1,
+    "active_training_branches_per_node": 1,
+    "cross_node_training": false,
+    "gpus_per_node": 8,
+    "training_tp": 2,
+    "training_dp": 1,
+    "training_pp": 1,
+    "training_cp": 1,
+    "initial_assignment": {
+      "worker-a": "B01_frozen_no_pi",
+      "worker-b": "B10_transported_PI",
+      "worker-c": "B11_frozen_worked_solution",
+      "worker-d": "BS_current_worked_solution"
+    },
+    "later_assignment": {
+      "worker-a": "A1_frozen_no_pi",
+      "worker-b": "A2_frozen_answer_only",
+      "worker-c": "A3_frozen_worked_solution",
+      "worker-d": "A4_frozen_unrelated_example"
+    },
+    "worker_count": 4,
+    "parallel_runs": 4,
+    "schedule": "B first: two matched blocks, four arms concurrently, four updates per branch. Review at 2 and 4 completed blocks; extend only for useful unresolved questions within caps, at most 8. A is conditional follow-up, not an automatic wave.",
+    "conditional_followup_experiments": 1
+  },
+  "model": {
+    "id": "Qwen/Qwen3-4B",
+    "revision": "1cfa9a7208912126459214e8b04321603b3df60c",
+    "student_thinking": false,
+    "teacher_thinking": false,
+    "lora_rank": 0,
+    "lora_alpha": null,
+    "lora_dropout": null,
+    "teacher_mode_status": "CONFIRMED_MATCHED_OFF",
+    "original_compatibility_teacher_thinking": true,
+    "all_study_modes": "non_thinking_rollout_teacher_scoring_and_evaluation",
+    "training_mode": "full_parameter",
+    "trainable_parameters": "all_student_parameters",
+    "teacher_parameters": "frozen_pinned_base_checkpoint"
+  },
+  "dataset": {
+    "id": "siyanzhao/Openthoughts_math_30k_opsd",
+    "revision": "1f33e9dc2e8a1c639ca74f8024ad4a9f1f5eae62",
+    "split_status": "pinned_v5_initial_stage_subsets_audited_and_manifested_before_training; full_proof_certification_not_claimed",
+    "requested_disjoint_groups": {
+      "warmup": 1024,
+      "adaptation": 4096,
+      "profiling": 256,
+      "utility": 2048,
+      "development": 256,
+      "final_test": 1024
+    },
+    "reserved_pools_not_evaluated_in_current_batch": [
+      "utility",
+      "final_test"
+    ],
+    "development_use": "readiness_timing_and_grader_diagnostics_only_not_reported_benchmarks"
+  },
+  "loss": {
+    "name": "full_vocabulary_forward_kl",
+    "beta": 0,
+    "temperature": 1.0,
+    "contribution_clip": null,
+    "extra_temperature_squared_factor": false,
+    "reduction": "mean_valid_response_tokens_then_mean_samples",
+    "all_targets_detached": true,
+    "target_refresh": "once_before_each_optimizer_update",
+    "temperature_note": "all_student_and_teacher_scoring_distributions_match_rollout_temperature_1.0"
+  },
+  "optimizer": {
+    "name": "Adam",
+    "lr": 5e-06,
+    "betas": [
+      0.9,
+      0.999
+    ],
+    "eps": 1e-08,
+    "weight_decay": 0,
+    "grad_norm_clip": 0.1,
+    "fresh_state_per_branch": true,
+    "lr_status": "5e-6_retained_from_full_parameter_smokes_and_current_finite_warmup"
+  },
+  "training": {
+    "seed": 17,
+    "global_batch": 4,
+    "microbatch": 1,
+    "updates_per_rollout_batch": 1,
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": -1,
+    "min_p": 0,
+    "response_cap": 4096,
+    "total_sequence_cap": 8192,
+    "teacher_prefix_cap": 4096,
+    "student_prefix_cap": 2048,
+    "thinking": false,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "repetition_penalty": 1.0,
+    "microbatch_status": "selected_one_for_lower_memory_no_observed_speed_loss_in_controlled_full_parameter_4K_replay"
+  },
+  "evaluation": {
+    "pi": false,
+    "thinking": false,
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "min_p": 0,
+    "response_cap": 16384,
+    "samples_per_question": 8,
+    "endpoint_update": 4,
+    "grader_pin_status": "implementation_and_dependency_hashes_recorded_40_live_plus_10_format_cases_audited",
+    "total_context_cap": 20480,
+    "templated_prefix_cap": 4096,
+    "response_budget_includes": "all_generated_reasoning_and_final_answer",
+    "max_position_embeddings_at_pinned_revision": 40960,
+    "rope_scaling": null,
+    "sampling_source": "https://huggingface.co/Qwen/Qwen3-4B#best-practices",
+    "sampling_mode": "qwen3_recommended_non_thinking",
+    "metric": "per_dataset_Avg_at_8_mean_correctness_per_question_then_mean_questions",
+    "seed_schedule": "eight_distinct_pinned_seeds_per_question_shared_across_checkpoints_and_arms",
+    "cadence": {
+      "fraction_of_planned_optimizer_updates": 0.1,
+      "steps_rule": "sorted(set(ceil(k * planned_updates / 10) for k in 1..10))",
+      "trigger": "after_completed_optimizer_update",
+      "include_initial_baseline": true,
+      "reuse_identical_branch_start_baseline": true,
+      "include_final_step_once": true,
+      "deduplicate_rounded_steps": true,
+      "checkpoint": "immutable_full_HF_snapshot_with_completed_optimizer_step_and_content_digest",
+      "queue": "bounded_async_pause_training_on_backpressure_never_skip_scheduled_step",
+      "resume": "persist_job_identity_and_results_no_duplicate_completed_evaluations",
+      "cache_key": [
+        "full_model_config_and_weight_content_hashes",
+        "tokenizer_template",
+        "evaluator_version",
+        "dataset_revisions_and_content_hashes",
+        "grader_version",
+        "sampling_configuration",
+        "request_seeds"
+      ],
+      "early_stop": "warmup stops only at existing listed milestones; drain every reached evaluation; branch stage review only after all four updates in all arms; no retrospective milestone rescaling"
+    },
+    "profiled_concurrency_per_gpu": 32,
+    "fleet_validation": "six_replica_full_checkpoint_queue_passed_800_responses_16K_non_thinking; staged_cost_contention_retention_and_recovery_validation_pending",
+    "concurrency_candidate": 32,
+    "truncation_policy": {
+      "user_accepted": "approximately_10_percent",
+      "response_cap": 16384,
+      "overall_measured": 0.08125,
+      "report_per_dataset": true,
+      "material_worsening_requires_review": true,
+      "replaces_prior_five_percent_gate": true
+    }
+  },
+  "arms": {
+    "A": {
+      "A0": "unchanged",
+      "A1": "frozen_no_pi",
+      "A2": "frozen_answer_only",
+      "A3": "frozen_worked_solution",
+      "A4": "frozen_unrelated_example"
+    },
+    "B": {
+      "B00": "unchanged",
+      "B01": "frozen_no_pi",
+      "B10": "normalize(current_no_pi*frozen_worked_pi/frozen_no_pi)",
+      "B11": "frozen_worked_solution",
+      "BS": "current_worked_solution"
+    }
+  },
+  "capacity_proposal": {
+    "final_target_cache_gib_per_rank": 8,
+    "target_microbatch_gib_per_rank": 2,
+    "aggregate_cpu_staging_gib_per_rank": 24,
+    "status": "full_parameter_MB1_measured_51.738_GiB_at_4K_target_staging_and_branch_orchestration_remain_gated"
+  },
+  "gates": {
+    "profile_questions": 64,
+    "profile_responses_per_question": 2,
+    "cap_hit_fraction_max": 0.1,
+    "checkpoint_signal_to_repeat_noise_min": 5,
+    "repeat_noise_floor": 1e-05,
+    "reference_update_check": "Independent HF/Megatron update check remains failed. User accepted this limitation for the exploratory within-Miles study on October 9; do not claim parity or reproduction.",
+    "runtime_isolation": "passed_owned_isolated_clusters_preserved_shared_services",
+    "data_and_grader_audit": "Initial 28 warmup and 32 adaptation questions reviewed before training. Three warmup candidates rejected and three adaptation references replaced; matching bins and shared block identity preserved. Detailed derivation spot audit is not a formal proof certificate.",
+    "cost_projection": "Validate total initial two-block B-stage cost including actual warmup, training, features, checkpoint IO, startup, queue drain and all assigned idle GPUs. At the measured six-replica rate, generation alone is at most about 42.8 GPUh with maximum warmup and all 32 GPUs charged. Historical A+B envelope is no longer mandatory.",
+    "eval_profile_questions": 64,
+    "eval_profile_responses_per_question": 2,
+    "eval_cap_hit_fraction_max": null,
+    "teacher_mode_choice": "confirmed_student_and_teacher_thinking_off_verify_all_four_scoring_distributions",
+    "checkpoint_storage": "full_export_reload_and_six_replica_final_drain_passed; storage_IO_retention_and_restart_recovery_still_require_validation",
+    "eval_length_check": "retain_requested_16K_report_observed_truncation_user_accepted_approximately_10_percent_material_worsening_review",
+    "eval_truncation_policy": {
+      "response_cap": 16384,
+      "thinking": false,
+      "user_decision": "User accepted the observed approximately 10% truncation and chose to retain 16K; report final per-dataset censoring transparently.",
+      "prior_limit": 0.05,
+      "action": "retain_16K_and_report_truncation",
+      "material_worsening_requires_review": true
+    },
+    "adaptive_stop": "Bounded stop and final evaluation drain implemented and locally tested; live seven-update stage exercises the transition. Two-block worker controllers stop after all required evaluations; recovery beyond fail-closed stopping remains unvalidated."
+  },
+  "gpu_hour_caps": {
+    "readiness": 64,
+    "paired_study_including_warmup": 96,
+    "total": 160,
+    "basis": "all_assigned_gpus_times_job_wall_hours_including_idle_slots",
+    "runtime_feasibility": "User authorized initial exploratory launch despite documented update mismatch; hard shared deadline bounds assigned GPU cost; review cost and information before each extension.",
+    "authorization": "User explicitly approved 64 readiness / 160 total on 2026-10-09; full study remains 96."
+  },
+  "automatic_reservation_extension": false,
+  "confirmation_authorized": false,
+  "later_training_seeds_proposed": [
+    29,
+    43
+  ],
+  "deferred": [
+    "confirmatory_selector",
+    "longer_multiseed_runs",
+    "retention_and_independent_benchmarks",
+    "code_transfer",
+    "MOPD",
+    "RL_PI_generator",
+    "frontier_models"
+  ],
+  "original_sampling_comparison": {
+    "reference_revision": "ae7d2519e94920c4eb6206c0c26de46d9c50abae",
+    "original_response_cap": 1024,
+    "original_student_thinking": false,
+    "original_teacher_thinking": true,
+    "original_loss_contribution_clip": 0.05,
+    "original_eval_response_cap": 38912,
+    "entire_protocol_identical": false,
+    "original_training": {
+      "temperature": 1.1,
+      "top_p": 0.95,
+      "top_k": 20
+    },
+    "selected_training": {
+      "temperature": 1.0,
+      "top_p": 1.0,
+      "top_k": -1
+    },
+    "sampling_matches_original": false,
+    "original_loss_temperature": 1.1,
+    "selected_loss_temperature": 1.0
+  },
+  "benchmark_evaluation": {
+    "status": "READINESS_BASELINE_AND_FULL_CHECKPOINT_QUEUE_COMPLETE_SCIENTIFIC_BRANCHES_NOT_STARTED",
+    "when": "initial_baseline_and_each_10_percent_optimizer_update_milestone",
+    "response_cap": 16384,
+    "benchmark_entries_before_overlap_audit": 100,
+    "completions_per_checkpoint": 800,
+    "response_token_ceiling_per_checkpoint": 13107200,
+    "preparation_status": "pinned_prompt_only_and_separate_label_exports_hashed_heuristic_overlap_filter_complete",
+    "metric": "per_dataset_Avg_at_8_not_pass_at_8_or_majority_vote",
+    "training_overlap_policy": "exclude_matching_problem_groups_from_training_PI_donor_profiling_development_and_reserved_internal_pools",
+    "datasets": [
+      {
+        "name": "AIME 2024",
+        "id": "HuggingFaceH4/aime_2024",
+        "revision": "2fe88a2f1091d5048c0f36abc874fb997b3dd99a",
+        "config": "default",
+        "split": "train",
+        "questions": 30,
+        "samples_per_question": 8,
+        "role": "Competition reasoning; report separately by year.",
+        "completions_per_checkpoint": 240
+      },
+      {
+        "name": "AIME 2025",
+        "id": "yentinglin/aime_2025",
+        "revision": "6f71d77b0b89b9dabe07ab466c51df33f514df7f",
+        "config": "default",
+        "split": "train",
+        "questions": 30,
+        "samples_per_question": 8,
+        "role": "Competition reasoning; use default config, not duplicated part1/part2.",
+        "completions_per_checkpoint": 240
+      },
+      {
+        "name": "AMC23",
+        "id": "math-ai/amc23",
+        "revision": "80815d37005feb82cd7f8fbc6901d5d3eff43057",
+        "config": "default",
+        "split": "test",
+        "questions": 40,
+        "samples_per_question": 8,
+        "role": "Contest math; preserve this 40-question variant and report separately.",
+        "completions_per_checkpoint": 320
+      }
+    ],
+    "interpretation": "adaptive_exploratory_step_four_effects_per_dataset_not_confirmatory_or_untouched_final_test",
+    "uncertainty": "paired_resampling_of_adaptation_blocks_and_benchmark_problem_groups_retaining_all_arms_checkpoints_and_shared_controls"
+  },
+  "full_runs_launched": true,
+  "protocol_exception_review_required": false,
+  "readiness_results": {
+    "date": "2026-10-08",
+    "full_run_authorization": "User requested smoke tests, memory/speed tuning, then full runs after passing gates.",
+    "full_runs_launched": false,
+    "selected_microbatch": 2,
+    "effective_batch": 4,
+    "controlled_4K_replay": {
+      "microbatch_2": {
+        "peak_gpu_gib": 50.09,
+        "train_seconds": 8.1089
+      },
+      "microbatch_4": {
+        "peak_gpu_gib": 87.93,
+        "train_seconds": 7.879
+      },
+      "scope": "four synthetic 4096-token responses with maximal student/teacher prefixes; not learning evidence"
+    },
+    "training_profile": {
+      "responses": 128,
+      "cap_hits": 1,
+      "mean_tokens": 997.12,
+      "seconds": 34.49
+    },
+    "evaluation_profiles": [
+      {
+        "concurrency": 32,
+        "completions": 800,
+        "seconds": 617.8297,
+        "tokens_per_second": 3593.14,
+        "responses_per_second": 1.29486,
+        "cap_fraction": {
+          "AIME_2024": 0.19166666666666668,
+          "AIME_2025": 0.11666666666666667,
+          "AMC23": 0.0125
+        },
+        "response_cap": 8192,
+        "total_context_cap": 12288
+      },
+      {
+        "concurrency": 128,
+        "completions": 800,
+        "seconds": 374.424,
+        "tokens_per_second": 5845.14,
+        "responses_per_second": 2.136615,
+        "peak_gpu_gib": 94.2,
+        "cap_fraction": {
+          "AIME_2024": 0.16666666666666666,
+          "AIME_2025": 0.1375,
+          "AMC23": 0.025
+        },
+        "response_cap": 8192,
+        "total_context_cap": 12288
+      }
+    ],
+    "evaluation_profile_caveat": "Different schedules produced different sampled outputs. Throughput comparison does not estimate an accuracy effect.",
+    "adapter_evaluation_smoke": {
+      "completions": 64,
+      "loaded_adapter_sha256": "1476c52790c1d6c3cf3f1740189b2acb74e217bbddf8e0eaa22c1a6413f44f12",
+      "status": "completed_not_a_quality_gate_pass",
+      "response_cap": 8192
+    },
+    "mapped_update": {
+      "status": "failed",
+      "mean_loss": 0.07312913774512708,
+      "grad_norm": 3.2153685092926025,
+      "update_cosine": 0.9333312982591488,
+      "update_relative_l2_error": 0.36513933391043146,
+      "max_parameter_error": 1.0013580322265625e-05,
+      "tolerances": {
+        "minimum_update_cosine": 0.95,
+        "maximum_update_relative_l2_error": 0.35,
+        "maximum_parameter_error": 2e-05
+      },
+      "examples": 4,
+      "match_norm_arithmetic": false,
+      "mapped_gradients": {
+        "cosine": 0.9932767023124218,
+        "relative_l2_error": 0.14572511323497825
+      }
+    },
+    "mapped_update_scope": "four identical real prefixes/responses truncated to 32 response tokens; FP64 comparison reductions; representative base-weight probes bitwise equal, first-layer BF16 activations diverge slightly; root cause not established",
+    "tests": {
+      "remote_focused_passed": 111,
+      "additional_evaluation_protocol_passed": 4,
+      "grader_format_cases_rechecked": 10,
+      "study_launcher_snapshot_passed": 2,
+      "broad_macOS_launcher_suite": "410 passed, 26 failed, 134 errors; environment-dependent Linux/root-path failures; not green",
+      "isolated_launcher_guard_passed": 2
+    },
+    "data": {
+      "source_rows": 29434,
+      "eligible_groups": 28422,
+      "reserved_disjoint_groups": 8704,
+      "rejections": {
+        "reference_answer": 874,
+        "solved_prompt_artifact": 18,
+        "duplicate_group": 120
+      },
+      "unmatched_unrelated_donors": 2,
+      "manual_reasoning_audit": "limited spot checks only; final candidate audit incomplete"
+    },
+    "pending": [
+      "full_parameter_teacher_freeze_restoration_forward_backward_and_mapped_update_validation",
+      "16K_non_thinking_evaluation_length_memory_throughput_reprofile_after_explicit_resume",
+      "full_parameter_batch_size_and_total_cost_profile_effective_batch_four",
+      "full_model_checkpoint_export_reload_version_pin_and_queue_end_to_end_validation",
+      "checkpoint_storage_IO_and_retention_budget_validation",
+      "finish_final_data_reasoning_audit",
+      "shared_PI_feature_extraction_and_branch_orchestration",
+      "theta64_drift_gate_after_authorized_warmup"
+    ],
+    "public_artifacts": "Only aggregate metrics and generic worker labels; runtime configs, raw responses and logs stay private.",
+    "owned_gpu_jobs_active": false,
+    "owned_evaluators_stopped": true,
+    "recipe": "historical_LoRA_rank_64_training_and_8192_token_evaluation",
+    "status": "historical_LoRA_evidence_and_pending_list_superseded_by_current_readiness"
+  },
+  "resume_requires_explicit_user_instruction": false,
+  "monitor_status": "ACTIVE",
+  "protocol_revision": {
+    "date": "2026-10-09",
+    "training_mode": "full_parameter",
+    "evaluation_response_cap": 16384,
+    "evaluation_thinking": false,
+    "evaluation_context_cap": 20480,
+    "prior_LoRA_and_8K_metrics_are_historical": true,
+    "gpu_validation": "four_context_full_parameter_smokes_identity_reload_and_16K_queue_passed_independent_update_parity_failed"
+  },
+  "current_readiness": {
+    "tiny_full_parameter_tp2": {
+      "status": "passed",
+      "teacher_max_abs_logprob_error": 0.0035505294799804688,
+      "optimizer_updates": 2,
+      "frozen_teacher_bitwise_stable": true,
+      "exception_restore_passed": true,
+      "transported_dense_max_abs_error": 0.0
+    },
+    "focused_CPU": "39 passed, 24 external/distributed checks skipped locally; remote pinned-author suite 78 passed, 1 skipped; 9 evaluator protocol tests passed locally",
+    "four_smokes": "completed_two_updates_per_context_unrelated_retested_with_matched_block",
+    "evaluation_16K": {
+      "status": "completed",
+      "adapter_sha256": null,
+      "checkpoint_sha256": "b0016d6c2daf51fb81e19915884e8c24e1f819fe71f6ac9fda3d59e02e0209c8",
+      "prompts_sha256": "57ab614317fe8d8e614da2b7ea22f5fae7e3751d2d028bd5801cd266edc35163",
+      "labels_sha256": "a6ad70a1449c7f7149d0a5a4dd96c865b25cdf75851ce1f7af02f9a2978c5028",
+      "elapsed_seconds": 1198.1969929650077,
+      "concurrency_per_server": 32,
+      "servers": 1,
+      "completions": 800,
+      "responses_per_second": 0.6676698445222716,
+      "output_tokens_per_second": 2316.995465937609,
+      "mean_response_tokens": 3470.27125,
+      "p95_latency_seconds": 213.90226372052274,
+      "metrics": {
+        "AIME 2024": {
+          "avg_at_8": 0.2125,
+          "completions": 240,
+          "cap_hit_fraction": 0.12916666666666668,
+          "parse_failure_fraction": 0.11666666666666667,
+          "grader_timeouts": 0,
+          "unexpected_thinking_delimiters": 0
+        },
+        "AIME 2025": {
+          "avg_at_8": 0.20416666666666666,
+          "completions": 240,
+          "cap_hit_fraction": 0.09166666666666666,
+          "parse_failure_fraction": 0.07916666666666666,
+          "grader_timeouts": 0,
+          "unexpected_thinking_delimiters": 0
+        },
+        "AMC23": {
+          "avg_at_8": 0.671875,
+          "completions": 320,
+          "cap_hit_fraction": 0.0375,
+          "parse_failure_fraction": 0.028125,
+          "grader_timeouts": 0,
+          "unexpected_thinking_delimiters": 0
+        }
+      },
+      "interpretation": "Readiness baseline, not evidence of training gains; concurrency-dependent sampling."
+    },
+    "full_runs_launched": true,
+    "full_mapped_update": {
+      "status": "failed",
+      "training_mode": "full_parameter",
+      "examples": 4,
+      "mean_loss": 0.010582976741716266,
+      "grad_norm": 2.9601025581359863,
+      "mapped_gradients": {
+        "cosine": 0.9730727487428699,
+        "relative_l2_error": 0.2534193433075197
+      },
+      "mapped_update": {
+        "cosine": 0.8735106433010196,
+        "relative_l2_error": 0.505161604034182
+      },
+      "max_parameter_error": 1.52587890625e-05,
+      "tolerances": {
+        "minimum_update_cosine": 0.95,
+        "maximum_update_relative_l2_error": 0.35,
+        "maximum_parameter_error": 2e-05
+      }
+    },
+    "identity_check": {
+      "status": "passed",
+      "updates": 2,
+      "losses": [
+        0.0,
+        0.0
+      ],
+      "gradient_norms": [
+        0.0,
+        0.0
+      ]
+    },
+    "full_checkpoint_reload": {
+      "status": "passed",
+      "updates": 2
+    },
+    "full_4K_microbatch_two": {
+      "status": "passed",
+      "peak_gpu_gib": 73.6640625,
+      "train_seconds": 6.207693099975586
+    },
+    "six_replica_queue": {
+      "status": "passed_final_milestone_drained",
+      "replicas": 6,
+      "completions": 800,
+      "response_cap": 16384,
+      "responses_per_second": 3.1600935061407274,
+      "thinking_delimiters": 0,
+      "peak_gpu_gib": 114.748046875,
+      "generation_seconds": 253.1570659049903,
+      "total_process_seconds": 372.5393946170807,
+      "output_tokens_per_second": 9431.409672349715
+    },
+    "checkpoint_bytes_per_update": 64380567856,
+    "checkpoint_retention_status": "Retain all native and HF snapshots for initial stage; shared free capacity approximately 77 TB at launch. No checkpoint deletion required.",
+    "broad_launcher_suite": {
+      "modified": "558 passed, 70 failed, 10 errors, 34 skipped",
+      "baseline_comparison": "same 80 failure/error cases at unchanged baseline; no introduced failures; suite remains not green"
+    },
+    "controlled_full_4K_replay": {
+      "microbatch_one": {
+        "train_seconds": 6.186232566833496,
+        "peak_gpu_gib": 51.73828125
+      },
+      "microbatch_two": {
+        "train_seconds": 6.207693099975586,
+        "peak_gpu_gib": 73.6640625
+      },
+      "selected_microbatch": 1,
+      "caveat": "One step per setting on the same tape; timing difference is within measurement noise. MB1 uses less memory."
+    },
+    "optimizer_isolation": {
+      "status": "passed",
+      "training_mode": "full_parameter",
+      "examples": 4,
+      "mean_loss": 0.010582976741716266,
+      "grad_norm": 2.5686421394348145,
+      "mapped_gradients": {
+        "cosine": 1.0,
+        "relative_l2_error": 0.0
+      },
+      "mapped_update": {
+        "cosine": 0.9999999810492424,
+        "relative_l2_error": 0.00019468311424730134
+      },
+      "max_parameter_error": 7.62939453125e-06,
+      "tolerances": {
+        "minimum_update_cosine": 0.95,
+        "maximum_update_relative_l2_error": 0.35,
+        "maximum_parameter_error": 2e-05
+      },
+      "scope": "Same captured gradients deliberately supplied to HF Adam; isolates optimizer/mapping only, not independent forward/backward parity."
+    },
+    "wandb": "disabled_readiness_metrics_private_logs_and_HTML_only",
+    "active_GPU_jobs": "four_B_arm_training_processes_running_with_isolated_evaluation_fleets",
+    "readiness_gpu_hour_accounting": {
+      "prior_gpu_hours": 29.6,
+      "new_job_union_gpu_hours": 9.294056256612143,
+      "total_gpu_hours_upper_estimate": 39.12600701438056,
+      "unplaced_CPU_test_seconds_charged_separately_conservatively": true,
+      "all_four_worker_window_gpu_hours_upper_bound": 47.96921477423774,
+      "PR3741_cancelled_validation_gpu_hours": 0.23195075776841906
+    },
+    "pending": [
+      "independent_HF_Megatron_update_mismatch_known_user_accepted_limitation",
+      "same_backend_Megatron_score_noise_and_shared_PI_features_before_mechanism_analysis",
+      "live_balanced_stage_completion_and_all_evaluation_records",
+      "per_dataset_step_four_effects_and_measured_cost_review"
+    ],
+    "historical_full_matrix_cost_projection": {
+      "status": "superseded_full_A_plus_B_envelope",
+      "evaluation_only_allocated_gpu_hours_current_schedule": 168.77137726999354,
+      "study_cap_gpu_hours": 96,
+      "basis": "Measured six-replica C32 rate extrapolated to four equal fleets; generation only. Excludes initialization, reload, checkpoint IO, training, feature pass and contention. Further throughput tuning required; do not reduce matrix or skip checkpoints."
+    },
+    "current_cost_projection": {
+      "status": "bounded_initial_stage_launched_with_live_measurements_and_hard_deadline",
+      "measured_six_replica_responses_per_second": 3.1600935061407274,
+      "initial_two_block_generation_only_max_warmup_gpu_hours": 42.75541557506503,
+      "study_cap_gpu_hours": 96,
+      "basis": "Assume all 32 assigned GPUs charged throughout serialized warmup evaluation then concurrent branch evaluations at equal measured fleet rates. Excludes training, features, startup, IO and contention; no cost-gate pass inferred."
+    }
+  },
+  "next_scientific_runs": {
+    "priority": "B_checkpoint_separation",
+    "warmup": "up to 64 worked-solution OPSD updates; stop at earliest fixed drift-check milestone passing the predeclared noise gate",
+    "first_wave": [
+      "B01_frozen_no_pi",
+      "B10_transported_PI",
+      "B11_frozen_worked_solution",
+      "BS_current_worked_solution"
+    ],
+    "initial_blocks": 2,
+    "conditional_extension_cumulative_blocks": [
+      4,
+      8
+    ],
+    "updates_per_branch": 4,
+    "shared_start": "theta_star with fresh Adam for every branch",
+    "unchanged_baseline": true,
+    "A_followup": "conditional only after B review; no automatic matrix or epoch completion",
+    "launch_status": "four_B_arm_controllers_launched_after_completed_warmup_and_both_evaluations"
+  },
+  "historical_full_matrix_envelope": {
+    "warmup_updates": 64,
+    "warmup_response_uses": 256,
+    "blocks_per_experiment": 8,
+    "adaptation_questions_per_block": 16,
+    "preupdate_feature_responses_shared": 256,
+    "active_arms_per_experiment": 4,
+    "branches_total": 64,
+    "updates_per_branch": 4,
+    "branch_updates_total": 256,
+    "branch_training_response_uses": 1024,
+    "readiness_work": "additional, separately counted within cap",
+    "evaluation_questions_shared_across_blocks": 100,
+    "eval_completions_per_checkpoint": 800,
+    "warmup_eval_steps": [
+      0,
+      7,
+      13,
+      20,
+      26,
+      32,
+      39,
+      45,
+      52,
+      58,
+      64
+    ],
+    "branch_eval_steps": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "warmup_eval_checkpoints": 11,
+    "branch_eval_checkpoints": 256,
+    "scheduled_eval_checkpoints_total": 267,
+    "warmup_eval_completions": 8800,
+    "branch_milestone_eval_completions": 204800,
+    "shared_branch_baseline_reused_from_warmup_step": 64,
+    "primary_endpoint_eval_completions_including_shared_baseline": 52000,
+    "primary_endpoint_subset_already_in_total": true,
+    "scheduled_eval_completions_total": 213600,
+    "scheduled_eval_response_token_ceiling": 3499622400,
+    "eval_allocation": {
+      "worker-a": {
+        "branch_completions": 51200
+      },
+      "worker-b": {
+        "branch_completions": 51200
+      },
+      "worker-c": {
+        "branch_completions": 51200
+      },
+      "worker-d": {
+        "branch_completions": 51200,
+        "shared_warmup_completions": 8800
+      }
+    },
+    "status": "superseded_8_blocks_each_A_and_B_not_a_required_workload"
+  },
+  "first_batch": {
+    "experiment": "B_checkpoint_separation",
+    "initial_blocks": 2,
+    "maximum_blocks": 8,
+    "cumulative_review_blocks": [
+      2,
+      4,
+      8
+    ],
+    "active_arms": 4,
+    "updates_per_branch": 4,
+    "adaptation_questions_per_block": 16,
+    "warmup_max_updates": 64,
+    "warmup_eval_and_drift_check_steps": [
+      7,
+      13,
+      20,
+      26,
+      32,
+      39,
+      45,
+      52,
+      58,
+      64
+    ],
+    "warmup_stop": "earliest listed milestone passing the fixed-panel drift-to-repeat-noise gate; stop at 64 as unresolved if none passes; do not select by benchmark accuracy",
+    "shared_start": "theta_star_selected_by_drift_gate_with_fresh_Adam_each_branch",
+    "preupdate_feature_responses_per_block": 32,
+    "feature_collection": "only blocks actually reached",
+    "eval_completions_per_checkpoint": 800,
+    "branch_eval_steps": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "warmup_eval_completions_rule": "800*(1+number_of_reached_warmup_milestones)",
+    "branch_baseline": "reuse_identical_theta_star_evaluation",
+    "stages": [
+      {
+        "cumulative_blocks": 2,
+        "branches": 8,
+        "branch_updates": 32,
+        "branch_training_response_uses": 128,
+        "preupdate_feature_responses": 64,
+        "branch_eval_checkpoints": 32,
+        "branch_eval_completions": 25600,
+        "eval_completions_with_maximum_warmup": 34400,
+        "evaluation_generation_only_gpu_hours_with_maximum_warmup": 42.75541557506503
+      },
+      {
+        "cumulative_blocks": 4,
+        "branches": 16,
+        "branch_updates": 64,
+        "branch_training_response_uses": 256,
+        "preupdate_feature_responses": 128,
+        "branch_eval_checkpoints": 64,
+        "branch_eval_completions": 51200,
+        "eval_completions_with_maximum_warmup": 60000,
+        "evaluation_generation_only_gpu_hours_with_maximum_warmup": 60.75769581719767
+      },
+      {
+        "cumulative_blocks": 8,
+        "branches": 32,
+        "branch_updates": 128,
+        "branch_training_response_uses": 512,
+        "preupdate_feature_responses": 256,
+        "branch_eval_checkpoints": 128,
+        "branch_eval_completions": 102400,
+        "eval_completions_with_maximum_warmup": 111200,
+        "evaluation_generation_only_gpu_hours_with_maximum_warmup": 96.76225630146295
+      }
+    ],
+    "no_epoch_requirement": true,
+    "readiness_work": "additional, separately counted within readiness cap",
+    "implementation_status": "two_blocks_and_all_evaluations_complete; balanced_endpoint_review_complete; shared_PI_features_pending"
+  },
+  "early_decision": {
+    "user_accepted_practical_improvement_percentage_points": 2,
+    "metric": "per_dataset_unhinted_step_four_Avg_at_8",
+    "benefit_contrasts": [
+      "B10-B00",
+      "BS-B00"
+    ],
+    "raw_OPSD_comparisons": [
+      "B10-B11",
+      "BS-B11"
+    ],
+    "checkpoint_and_interaction": [
+      "B11-B01",
+      "B11-B10-B01+B00"
+    ],
+    "review_unit": "complete matched block; all four arms and all reached evaluations drain before an efficacy review",
+    "continue_rule": "At 2 or 4 blocks, record the unresolved question and why additional blocks could change the decision. Extend to the next balanced stage only if numerics remain valid and measured total cost fits. No automatic completion of 8 blocks or A.",
+    "stop_rule": "Stop on invalid controls, non-finite updates, numerical failure, inability to fund the next complete stage, or sufficient exploratory mechanism evidence. Stop at 8 as inconclusive if useful effects remain uncertain. Failure stops are immediate; preserve and finish valid pending evaluations when possible.",
+    "interpretation": "A point estimate >=2pp is a candidate signal, not proof. A point estimate <2pp is not proof of futility. Report all three datasets and adverse effects; no best-benchmark or best-checkpoint selection.",
+    "uncertainty": "Exploratory paired block/problem resampling with question-only and block-only sensitivity; two blocks cannot reliably estimate training variability. Repeated nominal 95% intervals do not give optional-stopping-valid significance. No confirmatory success/futility claim in this adaptive pilot.",
+    "implementation_status": "private_controllers_enforce_two_blocks_then_stop; efficacy_review_requires_complete_balanced_stage"
+  },
+  "scientific_launch": {
+    "date": "2026-10-09",
+    "authorization": "Explicit user instruction: launch full runs after discussing numerical parity and adaptive execution limitations.",
+    "scope": "Initial two matched B blocks; four arms in parallel after shared checkpoint; four updates per branch; no full epoch and no automatic A wave.",
+    "source_commit": "12e66fc",
+    "phase": "four_training_processes_running",
+    "warmup_planned_horizon": 64,
+    "warmup_stop_after_updates": 7,
+    "warmup_required_evaluations": [
+      0,
+      7
+    ],
+    "branch_checkpoint": "shared_warmup_update_7",
+    "numerical_parity": {
+      "status": "failed_user_accepted_exploratory_exception",
+      "update_cosine": 0.87351064,
+      "relative_l2_error": 0.5051616,
+      "minimum_cosine": 0.95,
+      "maximum_relative_l2_error": 0.35
+    },
+    "checkpoint_drift_probe": {
+      "status": "pass_auxiliary_only",
+      "backend": "HF BF16 SDPA auxiliary same-backend probe",
+      "panel": "Four pre-existing short response tapes; exact archived token IDs; fixed before outcome inspection.",
+      "limitation": "This identifies checkpoint change on that panel; it does not validate Megatron numerical noise or replace the 64-trajectory PI feature pass.",
+      "median_vocab_rms_logprob_drift": 11.857122421264648,
+      "median_repeat_noise": 0.0,
+      "threshold": 5e-05,
+      "response_tokens": 128,
+      "probability_health": {
+        "tapes": [
+          {
+            "kl_r_p": 0.06525129079818726,
+            "top1_agreement": 0.90625,
+            "base_response_nll": 0.07073761522769928,
+            "warmed_response_nll": 0.16368743777275085,
+            "base_entropy": 0.11464913934469223,
+            "warmed_entropy": 0.16404949128627777
+          },
+          {
+            "kl_r_p": 0.0034748646430671215,
+            "top1_agreement": 1.0,
+            "base_response_nll": 0.06664063036441803,
+            "warmed_response_nll": 0.0428294762969017,
+            "base_entropy": 0.012543423101305962,
+            "warmed_entropy": 0.028122182935476303
+          },
+          {
+            "kl_r_p": 0.026300497353076935,
+            "top1_agreement": 1.0,
+            "base_response_nll": 0.05110618472099304,
+            "warmed_response_nll": 0.14967018365859985,
+            "base_entropy": 0.03724999725818634,
+            "warmed_entropy": 0.09194377809762955
+          },
+          {
+            "kl_r_p": 0.046776723116636276,
+            "top1_agreement": 0.96875,
+            "base_response_nll": 0.07981181144714355,
+            "warmed_response_nll": 0.12219579517841339,
+            "base_entropy": 0.10539040714502335,
+            "warmed_entropy": 0.18359482288360596
+          }
+        ],
+        "all_finite": true,
+        "checkpoint_choice_independent_of_eval": true
+      },
+      "interpretation": "Unweighted vocabulary RMS is sensitive to rare-token log probabilities. Supplementary probability-weighted KL is 0.00347\u20130.06525 nats per tape and top-1 agreement is 90.625\u2013100%; finite on all 128 tokens. Small fixed panel, not a general validation certificate."
+    },
+    "data_review": {
+      "warmup_rows": 28,
+      "adaptation_rows": 32,
+      "warmup_candidates_rejected": 3,
+      "adaptation_references_replaced": 3,
+      "shared_across_arms": true,
+      "selected_before_training": true,
+      "later_blocks_require_audit": true
+    },
+    "runtime": {
+      "training_gpus_per_worker": 2,
+      "evaluation_gpus_per_worker": 6,
+      "evaluation_replicas": 6,
+      "evaluation_concurrency_per_replica": 32,
+      "retain_all_initial_stage_checkpoints": false,
+      "deadline_seconds_from_initial_stage_setup": 10800,
+      "accounting": "Charge all eight assigned GPUs during each job, including waits; three-hour four-worker envelope caps study at 96 GPU-hours."
+    },
+    "evaluation": "AIME 2024 / AIME 2025 / AMC23; eight responses per question; 800 per checkpoint; no PI; thinking disabled; 16K response cap; every reached milestone including actual final stage checkpoint.",
+    "feature_status": "Shared 64 pre-update-checkpoint trajectories and PI features remain pending; preserve immutable theta-star and fixed seeds, collect before utility-model fitting or effect interpretation. Do not claim feature-to-learning evidence yet.",
+    "tests": {
+      "focused_study_and_evaluation_passed": 20,
+      "affected_launcher_snapshots_passed": 2,
+      "broad_macOS_suite": {
+        "passed": 348,
+        "failed": 88,
+        "errors": 134,
+        "interpretation": "Broad suite not green; environment/root-path failures observed, but no fresh baseline comparison was run. Focused modified-path checks passed."
+      }
+    },
+    "tracking": "Restricted online W&B; destination and actual links private; no automatic source, host, console, requirements or response upload.",
+    "common_checkpoint_sha256": "4c0d71023eaea23851516072eb0c5619f2c506af23766ac713dae78b2937cf5a",
+    "warmup_completed_updates": 7,
+    "warmup_evaluations_completed": [
+      0,
+      7
+    ],
+    "warmup_exit_code": 0,
+    "warmup_all_seven_losses_finite": true,
+    "warmup_loss_range": [
+      0.03949502483010292,
+      0.059957560151815414
+    ],
+    "warmup_training_gpu_peak_mib": 60211,
+    "warmup_evaluation_gpu_peak_mib": 117502,
+    "warmup_elapsed_seconds": 1008.0714690685272,
+    "warmup_evaluation_throughput": [
+      {
+        "step": 0,
+        "completions": 800,
+        "elapsed_seconds": 282.7684562000213,
+        "responses_per_second": 2.8291698824925002,
+        "output_tokens_per_second": 9817.986904579602,
+        "mean_response_tokens": 3470.27125,
+        "checkpoint_sha256": "b0016d6c2daf51fb81e19915884e8c24e1f819fe71f6ac9fda3d59e02e0209c8"
+      },
+      {
+        "step": 7,
+        "completions": 800,
+        "elapsed_seconds": 208.14285052003106,
+        "responses_per_second": 3.8435141923023215,
+        "output_tokens_per_second": 8462.289219155722,
+        "mean_response_tokens": 2201.70625,
+        "checkpoint_sha256": "4c0d71023eaea23851516072eb0c5619f2c506af23766ac713dae78b2937cf5a"
+      }
+    ],
+    "workers": {
+      "worker-a": {
+        "arm": "B01_frozen_no_pi",
+        "controller_launched": true,
+        "phase": "training_process_running",
+        "completed_branch_updates": 0
+      },
+      "worker-b": {
+        "arm": "B10_transported_PI",
+        "controller_launched": true,
+        "phase": "training_process_running",
+        "completed_branch_updates": 0
+      },
+      "worker-c": {
+        "arm": "B11_frozen_worked_solution",
+        "controller_launched": true,
+        "phase": "training_process_running",
+        "completed_branch_updates": 0
+      },
+      "worker-d": {
+        "arm": "BS_current_worked_solution",
+        "controller_launched": true,
+        "phase": "training_process_running",
+        "completed_branch_updates": 0
+      }
+    },
+    "warmup_training_timing": {
+      "perf/actor_train_time": {
+        "min": 1.1419963836669922,
+        "max": 3.141690492630005,
+        "mean": 1.6609819957188197
+      },
+      "perf/actor_train_tok_per_s": {
+        "min": 1552.9855698533945,
+        "max": 4534.673976632328,
+        "mean": 3012.5085639050076
+      },
+      "perf/save_model_time": {
+        "min": 31.045697450637817,
+        "max": 34.71320819854736,
+        "mean": 31.7934734026591
+      },
+      "perf/step_time": {
+        "min": 54.51760673522949,
+        "max": 70.44333291053772,
+        "mean": 61.7192543234144
+      },
+      "interpretation": "Actor timing excludes rollout, teacher passes, checkpoint IO and evaluation waits. End-to-end step time averaged 61.7 seconds; save time averaged 31.8 seconds. Short-run measurements only."
+    },
+    "code_commit": "268f58f"
+  },
+  "tracking_restart": {
+    "updated_utc": "2026-10-09 19:53 UTC",
+    "original_B_attempt": "excluded: warmed HF source overridden with base model",
+    "first_tracked_startup": "failed before training: inherited W&B SDK service; fixed and live validated",
+    "source_commit": "268f58f",
+    "recovery_checkpoints": false,
+    "temporary_eval_snapshots": "local storage; delete after successful verified evaluation and upload",
+    "current_status": "all four arms complete; two-block comparison complete; shared PI features pending",
+    "matrix_and_budget_unchanged": true,
+    "speedup_claim": "saving overhead reduced from about 38\u201341 seconds to 14.36\u201314.56 seconds on first unblocked calls; no overall multiplier established",
+    "validation": {
+      "focused_cpu": 31,
+      "tracking_service": 10,
+      "launcher_snapshots": 2,
+      "linux_selected_passes": 41,
+      "linux_unrelated_failures": 2,
+      "broad_launcher": {
+        "passed": 348,
+        "failed": 88,
+        "errors": 134
+      }
+    },
+    "workers": {
+      "worker-a": {
+        "arm": "B01_frozen_no_pi",
+        "observed_updates": 1,
+        "first_loss": 0.02219287119805813,
+        "warm_load_confirmed": true,
+        "native_checkpoints_written": false,
+        "hosted_loss_history_verified": true
+      },
+      "worker-b": {
+        "arm": "B10_transported_PI",
+        "observed_updates": 2,
+        "first_loss": 0.1004326269030571,
+        "warm_load_confirmed": true,
+        "native_checkpoints_written": false,
+        "hosted_loss_history_verified": true
+      },
+      "worker-c": {
+        "arm": "B11_frozen_worked_solution",
+        "observed_updates": 2,
+        "first_loss": 0.05484228581190109,
+        "warm_load_confirmed": true,
+        "native_checkpoints_written": false,
+        "hosted_loss_history_verified": true
+      },
+      "worker-d": {
+        "arm": "BS_current_worked_solution",
+        "observed_updates": 2,
+        "first_loss": 0.04886435717344284,
+        "warm_load_confirmed": true,
+        "native_checkpoints_written": false,
+        "hosted_loss_history_verified": true
+      }
+    },
+    "unblocked_export_seconds": [
+      14.43040418624878,
+      14.558241367340088,
+      14.360893487930298
+    ],
+    "evaluation_recovery": {
+      "fix_commit": "fa63329",
+      "reached_updates_per_arm": 3,
+      "required_partial_evaluations": 12,
+      "verified_reused_evaluations": 2,
+      "optimizer_recovery": false,
+      "prior_partial_branches": "diagnostics only; do not replace complete four-update branches",
+      "retry": "two matched blocks from same warm source with fresh Adam, only after drain and at least one hour before existing deadline",
+      "validation": "10 focused tests; live independent evaluator inheritance check passes; hosted metrics verified"
+    }
+  },
+  "latest_monitor": {
+    "time_utc": "2026-10-09T21:19:54.926868+00:00",
+    "phase": "two matched blocks complete; shared PI features pending",
+    "current_arms": {
+      "B01": {
+        "training_updates": 8,
+        "evaluations": 8,
+        "complete": true
+      },
+      "B10": {
+        "training_updates": 8,
+        "evaluations": 8,
+        "complete": true
+      },
+      "B11": {
+        "training_updates": 8,
+        "evaluations": 8,
+        "complete": true
+      },
+      "BS": {
+        "training_updates": 8,
+        "evaluations": 8,
+        "complete": true
+      }
+    },
+    "training_updates": 32,
+    "completed_evaluations": 32,
+    "planned_updates": 32,
+    "planned_evaluations": 32,
+    "recovered_r4_evaluations": 12,
+    "verified_hosted_local_evaluations": 44,
+    "new_failures": false,
+    "completed_worker_gpus_released": [
+      "worker-a",
+      "worker-b",
+      "worker-c",
+      "worker-d"
+    ]
+  },
+  "wandb_api_snapshot": {
+    "as_of_utc": "2026-10-09T20:36:43.987981+00:00",
+    "source": "W&B API scan_history(use_cache=False); warmed baseline from verified local evaluation",
+    "crosschecked_completed_evaluations": 17,
+    "current_runs": {
+      "B01": {
+        "branch": "B01-r5-block-00",
+        "observed_training_updates": 3,
+        "losses": [
+          0.02219287119805813,
+          0.014792506583034992,
+          0.008447937667369843
+        ],
+        "gradient_norms": [
+          1.5786281824111938,
+          1.157332420349121,
+          0.8190632462501526
+        ],
+        "evaluations": {},
+        "timing": {
+          "perf/longest_sample_tokens_per_sec": {
+            "mean": 110.0140495033453,
+            "min": 87.49719284926591,
+            "max": 145.80844418840343,
+            "n": 3
+          },
+          "perf/effective_tokens_per_gpu_per_sec": {
+            "mean": 127.59136799777669,
+            "min": 113.26025518821643,
+            "max": 150.37205323260602,
+            "n": 3
+          },
+          "perf/tokens_per_gpu_per_sec": {
+            "mean": 127.59136799777669,
+            "min": 113.26025518821643,
+            "max": 150.37205323260602,
+            "n": 3
+          },
+          "perf/rollout_time": {
+            "mean": 18.620648701985676,
+            "min": 15.42906641960144,
+            "max": 22.02204418182373,
+            "n": 3
+          },
+          "perf/actor_train_time": {
+            "mean": 1.3936716715494792,
+            "min": 1.1371378898620605,
+            "max": 1.5629615783691406,
+            "n": 3
+          },
+          "perf/update_weights_time": {
+            "mean": 0.7634588877360026,
+            "min": 0.754765510559082,
+            "max": 0.7680590152740479,
+            "n": 3
+          },
+          "perf/step_time": {
+            "mean": 48.21901686986288,
+            "min": 41.72245764732361,
+            "max": 53.94847130775452,
+            "n": 3
+          },
+          "perf/actor_train_tok_per_s": {
+            "mean": 3848.6807022593807,
+            "min": 2526.6136126778956,
+            "max": 4804.460333483058,
+            "n": 3
+          },
+          "perf/train_wait_time": {
+            "mean": 45.063807010650635,
+            "min": 38.44429421424866,
+            "max": 50.46858787536621,
+            "n": 3
+          },
+          "perf/train_time": {
+            "mean": 3.1552098592122397,
+            "min": 2.707582712173462,
+            "max": 3.4798834323883057,
+            "n": 3
+          },
+          "perf/save_model_time": {
+            "mean": 14.18857228755951,
+            "min": 13.765985012054443,
+            "max": 14.611159563064575,
+            "n": 2
+          }
+        }
+      },
+      "B10": {
+        "branch": "B10-r5-block-00",
+        "observed_training_updates": 4,
+        "losses": [
+          0.1004326269030571,
+          0.12798865139484406,
+          0.2006058394908905,
+          0.10364636033773422
+        ],
+        "gradient_norms": [
+          3.089456796646118,
+          3.470210552215576,
+          4.202138423919678,
+          2.2151923179626465
+        ],
+        "evaluations": {
+          "1": {
+            "eval/mean_response_tokens": 2150.215,
+            "eval/AIME_2025/grader_timeouts": 0,
+            "eval/AIME_2024/avg_at_8": 0.17916666666666667,
+            "eval/AIME_2024/parse_failure_fraction": 0.04583333333333333,
+            "eval/AIME_2025/completions": 240,
+            "eval/AIME_2024/grader_timeouts": 0,
+            "eval/AIME_2025/avg_at_8": 0.1625,
+            "eval/AIME_2024/cap_hit_fraction": 0.058333333333333334,
+            "eval/AIME_2025/parse_failure_fraction": 0.025,
+            "eval/AMC23/grader_timeouts": 0,
+            "eval/AMC23/avg_at_8": 0.6375,
+            "eval/AMC23/cap_hit_fraction": 0.015625,
+            "eval/AMC23/completions": 320,
+            "eval/AIME_2024/completions": 240,
+            "eval/completions": 800,
+            "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+            "eval/AMC23/unexpected_thinking_delimiters": 0,
+            "eval/step": 1,
+            "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+            "eval/output_tokens_per_second": 8014.832299088681,
+            "eval/AIME_2025/cap_hit_fraction": 0.04583333333333333,
+            "eval/AMC23/parse_failure_fraction": 0.0125,
+            "eval/responses_per_second": 3.7274562306972467
+          }
+        },
+        "timing": {
+          "perf/rollout_time": {
+            "mean": 12.97385436296463,
+            "min": 9.05002236366272,
+            "max": 15.419297456741333,
+            "n": 4
+          },
+          "perf/longest_sample_tokens_per_sec": {
+            "mean": 124.26698488956056,
+            "min": 87.55262707574128,
+            "max": 174.6957009021289,
+            "n": 4
+          },
+          "perf/effective_tokens_per_gpu_per_sec": {
+            "mean": 170.1627571102001,
+            "min": 113.33201171470955,
+            "max": 283.3142170228074,
+            "n": 4
+          },
+          "perf/tokens_per_gpu_per_sec": {
+            "mean": 170.1627571102001,
+            "min": 113.33201171470955,
+            "max": 283.3142170228074,
+            "n": 4
+          },
+          "perf/actor_train_tok_per_s": {
+            "mean": 3656.9204057896377,
+            "min": 2494.7616691925605,
+            "max": 4578.9153627211035,
+            "n": 4
+          },
+          "perf/train_wait_time": {
+            "mean": 75.72616863250732,
+            "min": 35.54026770591736,
+            "max": 183.7589075565338,
+            "n": 4
+          },
+          "perf/train_time": {
+            "mean": 6.600810945034027,
+            "min": 5.897385120391846,
+            "max": 7.294528245925903,
+            "n": 4
+          },
+          "perf/step_time": {
+            "mean": 82.32697957754135,
+            "min": 42.245330810546875,
+            "max": 191.05343580245972,
+            "n": 4
+          },
+          "perf/actor_train_time": {
+            "mean": 1.2679551839828491,
+            "min": 1.131420612335205,
+            "max": 1.5829167366027832,
+            "n": 4
+          },
+          "perf/update_weights_time": {
+            "mean": 0.7719873189926147,
+            "min": 0.7324378490447998,
+            "max": 0.8040363788604736,
+            "n": 4
+          },
+          "perf/save_model_time": {
+            "mean": 62.94426488876343,
+            "min": 13.692365646362305,
+            "max": 160.742981672287,
+            "n": 3
+          }
+        }
+      },
+      "B11": {
+        "branch": "B11-r5-block-00",
+        "observed_training_updates": 4,
+        "losses": [
+          0.05484228581190109,
+          0.049263693392276764,
+          0.05829953774809837,
+          0.03868476673960686
+        ],
+        "gradient_norms": [
+          1.7954572439193726,
+          1.536960482597351,
+          1.9704960584640503,
+          1.0121303796768188
+        ],
+        "evaluations": {
+          "1": {
+            "eval/mean_response_tokens": 2486.44875,
+            "eval/AIME_2024/grader_timeouts": 0,
+            "eval/AIME_2025/cap_hit_fraction": 0.075,
+            "eval/AMC23/cap_hit_fraction": 0.0125,
+            "eval/output_tokens_per_second": 9154.36725969541,
+            "eval/AIME_2025/grader_timeouts": 0,
+            "eval/AIME_2024/cap_hit_fraction": 0.09583333333333334,
+            "eval/step": 1,
+            "eval/AIME_2024/parse_failure_fraction": 0.07916666666666666,
+            "eval/completions": 800,
+            "eval/AIME_2025/completions": 240,
+            "eval/AMC23/unexpected_thinking_delimiters": 0,
+            "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+            "eval/AIME_2024/completions": 240,
+            "eval/AIME_2024/avg_at_8": 0.1625,
+            "eval/AIME_2025/avg_at_8": 0.1875,
+            "eval/AMC23/grader_timeouts": 0,
+            "eval/AMC23/completions": 320,
+            "eval/AMC23/avg_at_8": 0.61875,
+            "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+            "eval/AMC23/parse_failure_fraction": 0.009375,
+            "eval/AIME_2025/parse_failure_fraction": 0.05,
+            "eval/responses_per_second": 3.681703578123382
+          },
+          "2": {
+            "eval/AIME_2024/avg_at_8": 0.21666666666666667,
+            "eval/completions": 800,
+            "eval/AIME_2025/avg_at_8": 0.1625,
+            "eval/AMC23/unexpected_thinking_delimiters": 0,
+            "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+            "eval/AMC23/cap_hit_fraction": 0.009375,
+            "eval/AIME_2024/parse_failure_fraction": 0.05,
+            "eval/AIME_2025/cap_hit_fraction": 0.05,
+            "eval/AIME_2025/parse_failure_fraction": 0.03333333333333333,
+            "eval/mean_response_tokens": 2303.0525,
+            "eval/AMC23/grader_timeouts": 0,
+            "eval/AIME_2025/grader_timeouts": 0,
+            "eval/AIME_2024/completions": 240,
+            "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+            "eval/AIME_2024/cap_hit_fraction": 0.058333333333333334,
+            "eval/output_tokens_per_second": 7807.248907867325,
+            "eval/AIME_2025/completions": 240,
+            "eval/AIME_2024/grader_timeouts": 0,
+            "eval/step": 2,
+            "eval/AMC23/parse_failure_fraction": 0.009375,
+            "eval/responses_per_second": 3.389956984422772,
+            "eval/AMC23/completions": 320,
+            "eval/AMC23/avg_at_8": 0.65
+          }
+        },
+        "timing": {
+          "perf/tokens_per_gpu_per_sec": {
+            "mean": 162.3576243739605,
+            "min": 94.51099344372884,
+            "max": 216.21140459319113,
+            "n": 4
+          },
+          "perf/rollout_time": {
+            "mean": 15.629511058330536,
+            "min": 13.72130799293518,
+            "max": 18.489912509918213,
+            "n": 4
+          },
+          "perf/longest_sample_tokens_per_sec": {
+            "mean": 133.5103550716824,
+            "min": 73.0127846346403,
+            "max": 175.0295624132331,
+            "n": 4
+          },
+          "perf/effective_tokens_per_gpu_per_sec": {
+            "mean": 162.3576243739605,
+            "min": 94.51099344372884,
+            "max": 216.21140459319113,
+            "n": 4
+          },
+          "perf/actor_train_tok_per_s": {
+            "mean": 3878.391981442096,
+            "min": 2412.4059274497235,
+            "max": 4835.816394459431,
+            "n": 4
+          },
+          "perf/train_time": {
+            "mean": 3.205188572406769,
+            "min": 2.5825517177581787,
+            "max": 3.439901828765869,
+            "n": 4
+          },
+          "perf/update_weights_time": {
+            "mean": 1.276053786277771,
+            "min": 0.7517898082733154,
+            "max": 2.781923294067383,
+            "n": 4
+          },
+          "perf/train_wait_time": {
+            "mean": 80.62876009941101,
+            "min": 39.298500061035156,
+            "max": 193.87411522865295,
+            "n": 4
+          },
+          "perf/step_time": {
+            "mean": 83.83394867181778,
+            "min": 42.738401889801025,
+            "max": 197.29032564163208,
+            "n": 4
+          },
+          "perf/actor_train_time": {
+            "mean": 1.40874183177948,
+            "min": 1.1621649265289307,
+            "max": 1.6369550228118896,
+            "n": 4
+          },
+          "perf/save_model_time": {
+            "mean": 64.83942047754924,
+            "min": 14.28939414024353,
+            "max": 165.33150339126587,
+            "n": 3
+          }
+        }
+      },
+      "BS": {
+        "branch": "BS-r5-block-00",
+        "observed_training_updates": 4,
+        "losses": [
+          0.04886435717344284,
+          0.04941541329026222,
+          0.06271830201148987,
+          0.05290791764855385
+        ],
+        "gradient_norms": [
+          1.853973150253296,
+          1.7227346897125244,
+          2.267345905303955,
+          1.420246958732605
+        ],
+        "evaluations": {
+          "1": {
+            "eval/AIME_2025/parse_failure_fraction": 0.025,
+            "eval/mean_response_tokens": 2263.22625,
+            "eval/AIME_2025/grader_timeouts": 0,
+            "eval/AMC23/avg_at_8": 0.6375,
+            "eval/AIME_2024/avg_at_8": 0.18333333333333332,
+            "eval/step": 1,
+            "eval/AIME_2025/cap_hit_fraction": 0.04583333333333333,
+            "eval/responses_per_second": 3.808109378926306,
+            "eval/AIME_2025/completions": 240,
+            "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+            "eval/AIME_2024/cap_hit_fraction": 0.09583333333333334,
+            "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+            "eval/AMC23/cap_hit_fraction": 0.00625,
+            "eval/AMC23/parse_failure_fraction": 0.003125,
+            "eval/AIME_2024/parse_failure_fraction": 0.0875,
+            "eval/AIME_2024/grader_timeouts": 0,
+            "eval/AMC23/unexpected_thinking_delimiters": 0,
+            "eval/output_tokens_per_second": 8618.613109257212,
+            "eval/AMC23/grader_timeouts": 0,
+            "eval/AMC23/completions": 320,
+            "eval/AIME_2024/completions": 240,
+            "eval/completions": 800,
+            "eval/AIME_2025/avg_at_8": 0.14166666666666666
+          },
+          "2": {
+            "eval/AMC23/unexpected_thinking_delimiters": 0,
+            "eval/output_tokens_per_second": 7258.413963943042,
+            "eval/AMC23/grader_timeouts": 0,
+            "eval/AIME_2024/completions": 240,
+            "eval/AIME_2024/parse_failure_fraction": 0.0375,
+            "eval/completions": 800,
+            "eval/AIME_2025/completions": 240,
+            "eval/AIME_2025/avg_at_8": 0.125,
+            "eval/AIME_2025/cap_hit_fraction": 0.016666666666666666,
+            "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+            "eval/AIME_2024/grader_timeouts": 0,
+            "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+            "eval/AIME_2024/cap_hit_fraction": 0.041666666666666664,
+            "eval/AMC23/cap_hit_fraction": 0.00625,
+            "eval/AMC23/parse_failure_fraction": 0.003125,
+            "eval/mean_response_tokens": 1754.18375,
+            "eval/AIME_2025/grader_timeouts": 0,
+            "eval/AIME_2024/avg_at_8": 0.16666666666666666,
+            "eval/step": 2,
+            "eval/AIME_2025/parse_failure_fraction": 0.004166666666666667,
+            "eval/responses_per_second": 4.13777288949521,
+            "eval/AMC23/completions": 320,
+            "eval/AMC23/avg_at_8": 0.6
+          }
+        },
+        "timing": {
+          "perf/longest_sample_tokens_per_sec": {
+            "mean": 128.30848370362588,
+            "min": 88.12621883808977,
+            "max": 178.59233078239131,
+            "n": 4
+          },
+          "perf/effective_tokens_per_gpu_per_sec": {
+            "mean": 164.11201341632588,
+            "min": 114.07449438486066,
+            "max": 273.4834940051155,
+            "n": 4
+          },
+          "perf/tokens_per_gpu_per_sec": {
+            "mean": 164.11201341632588,
+            "min": 114.07449438486066,
+            "max": 273.4834940051155,
+            "n": 4
+          },
+          "perf/rollout_time": {
+            "mean": 14.374655723571777,
+            "min": 8.936553955078125,
+            "max": 21.542815446853638,
+            "n": 4
+          },
+          "perf/actor_train_tok_per_s": {
+            "mean": 3567.722366089605,
+            "min": 2428.8328336107993,
+            "max": 4467.624731941759,
+            "n": 4
+          },
+          "perf/train_wait_time": {
+            "mean": 76.20896804332733,
+            "min": 33.967817544937134,
+            "max": 181.21456503868103,
+            "n": 4
+          },
+          "perf/train_time": {
+            "mean": 3.0114479064941406,
+            "min": 2.4495880603790283,
+            "max": 3.386943817138672,
+            "n": 4
+          },
+          "perf/step_time": {
+            "mean": 79.22041594982147,
+            "min": 37.30857753753662,
+            "max": 184.0830647945404,
+            "n": 4
+          },
+          "perf/actor_train_time": {
+            "mean": 1.3538166284561157,
+            "min": 1.1117985248565674,
+            "max": 1.6258838176727295,
+            "n": 4
+          },
+          "perf/update_weights_time": {
+            "mean": 0.7763564586639404,
+            "min": 0.7604687213897705,
+            "max": 0.7996535301208496,
+            "n": 4
+          },
+          "perf/save_model_time": {
+            "mean": 62.06096649169922,
+            "min": 13.750751256942749,
+            "max": 157.79119539260864,
+            "n": 3
+          }
+        }
+      }
+    },
+    "interrupted_diagnostic_runs": {
+      "B01": {
+        "1": {
+          "eval/AMC23/completions": 320,
+          "eval/AIME_2024/cap_hit_fraction": 0.125,
+          "eval/AMC23/cap_hit_fraction": 0.00625,
+          "eval/AIME_2024/completions": 240,
+          "eval/AIME_2024/parse_failure_fraction": 0.10833333333333334,
+          "eval/AIME_2025/avg_at_8": 0.17916666666666667,
+          "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/completions": 240,
+          "eval/AMC23/unexpected_thinking_delimiters": 0,
+          "eval/step": 1,
+          "eval/AMC23/grader_timeouts": 0,
+          "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/parse_failure_fraction": 0.029166666666666667,
+          "eval/mean_response_tokens": 2599.68,
+          "eval/AIME_2025/cap_hit_fraction": 0.07083333333333333,
+          "eval/completions": 800,
+          "eval/AIME_2024/avg_at_8": 0.20416666666666666,
+          "eval/responses_per_second": 3.577174176498138,
+          "eval/AMC23/parse_failure_fraction": 0.003125,
+          "eval/output_tokens_per_second": 9299.50816315868,
+          "eval/AIME_2025/grader_timeouts": 0,
+          "eval/AIME_2024/grader_timeouts": 0,
+          "eval/AMC23/avg_at_8": 0.628125
+        },
+        "2": {
+          "eval/AMC23/completions": 320,
+          "eval/AIME_2024/cap_hit_fraction": 0.15416666666666667,
+          "eval/AMC23/cap_hit_fraction": 0.015625,
+          "eval/AIME_2024/completions": 240,
+          "eval/AIME_2024/parse_failure_fraction": 0.1125,
+          "eval/AIME_2025/avg_at_8": 0.21666666666666667,
+          "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/completions": 240,
+          "eval/AMC23/unexpected_thinking_delimiters": 0,
+          "eval/step": 2,
+          "eval/AMC23/grader_timeouts": 0,
+          "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/parse_failure_fraction": 0.07916666666666666,
+          "eval/mean_response_tokens": 3346.66625,
+          "eval/AIME_2025/cap_hit_fraction": 0.10833333333333334,
+          "eval/completions": 800,
+          "eval/AIME_2024/avg_at_8": 0.23333333333333334,
+          "eval/responses_per_second": 3.0654232988037324,
+          "eval/AMC23/parse_failure_fraction": 0.00625,
+          "eval/output_tokens_per_second": 10258.948696070116,
+          "eval/AIME_2025/grader_timeouts": 0,
+          "eval/AIME_2024/grader_timeouts": 0,
+          "eval/AMC23/avg_at_8": 0.665625
+        },
+        "3": {
+          "eval/AMC23/completions": 320,
+          "eval/AIME_2024/cap_hit_fraction": 0.24166666666666667,
+          "eval/AMC23/cap_hit_fraction": 0.021875,
+          "eval/AIME_2024/completions": 240,
+          "eval/AIME_2024/parse_failure_fraction": 0.1875,
+          "eval/AIME_2025/avg_at_8": 0.17083333333333334,
+          "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/completions": 240,
+          "eval/AMC23/unexpected_thinking_delimiters": 0,
+          "eval/step": 3,
+          "eval/AMC23/grader_timeouts": 0,
+          "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/parse_failure_fraction": 0.11666666666666667,
+          "eval/mean_response_tokens": 4061.0025,
+          "eval/AIME_2025/cap_hit_fraction": 0.15,
+          "eval/completions": 800,
+          "eval/AIME_2024/avg_at_8": 0.22916666666666666,
+          "eval/responses_per_second": 2.442069699926519,
+          "eval/AMC23/parse_failure_fraction": 0.0125,
+          "eval/output_tokens_per_second": 9917.251156575843,
+          "eval/AIME_2025/grader_timeouts": 0,
+          "eval/AIME_2024/grader_timeouts": 0,
+          "eval/AMC23/avg_at_8": 0.678125
+        }
+      },
+      "B10": {
+        "1": {
+          "eval/AMC23/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/avg_at_8": 0.1625,
+          "eval/AMC23/cap_hit_fraction": 0.015625,
+          "eval/responses_per_second": 3.7025354136670545,
+          "eval/AIME_2025/cap_hit_fraction": 0.04583333333333333,
+          "eval/AIME_2025/parse_failure_fraction": 0.025,
+          "eval/mean_response_tokens": 2150.215,
+          "eval/output_tokens_per_second": 7961.247184498106,
+          "eval/AIME_2024/grader_timeouts": 0,
+          "eval/AIME_2024/parse_failure_fraction": 0.04583333333333333,
+          "eval/AIME_2025/grader_timeouts": 0,
+          "eval/AIME_2024/avg_at_8": 0.17916666666666667,
+          "eval/completions": 800,
+          "eval/AIME_2024/cap_hit_fraction": 0.058333333333333334,
+          "eval/AIME_2025/completions": 240,
+          "eval/AMC23/grader_timeouts": 0,
+          "eval/AMC23/completions": 320,
+          "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+          "eval/step": 1,
+          "eval/AMC23/parse_failure_fraction": 0.0125,
+          "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2024/completions": 240,
+          "eval/AMC23/avg_at_8": 0.6375
+        },
+        "2": {
+          "eval/AMC23/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/avg_at_8": 0.12916666666666668,
+          "eval/AMC23/cap_hit_fraction": 0.00625,
+          "eval/responses_per_second": 4.101813975613527,
+          "eval/AIME_2025/cap_hit_fraction": 0.03333333333333333,
+          "eval/AIME_2025/parse_failure_fraction": 0.008333333333333333,
+          "eval/mean_response_tokens": 1782.9625,
+          "eval/output_tokens_per_second": 7313.380500494833,
+          "eval/AIME_2024/grader_timeouts": 0,
+          "eval/AIME_2024/parse_failure_fraction": 0.03333333333333333,
+          "eval/AIME_2025/grader_timeouts": 0,
+          "eval/AIME_2024/avg_at_8": 0.17083333333333334,
+          "eval/completions": 800,
+          "eval/AIME_2024/cap_hit_fraction": 0.041666666666666664,
+          "eval/AIME_2025/completions": 240,
+          "eval/AMC23/grader_timeouts": 0,
+          "eval/AMC23/completions": 320,
+          "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+          "eval/step": 2,
+          "eval/AMC23/parse_failure_fraction": 0.00625,
+          "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2024/completions": 240,
+          "eval/AMC23/avg_at_8": 0.60625
+        },
+        "3": {
+          "eval/AMC23/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/avg_at_8": 0.10833333333333334,
+          "eval/AMC23/cap_hit_fraction": 0.0125,
+          "eval/responses_per_second": 3.8981351714624113,
+          "eval/AIME_2025/cap_hit_fraction": 0.020833333333333332,
+          "eval/AIME_2025/parse_failure_fraction": 0.016666666666666666,
+          "eval/mean_response_tokens": 1663.455,
+          "eval/output_tokens_per_second": 6484.372441645006,
+          "eval/AIME_2024/grader_timeouts": 0,
+          "eval/AIME_2024/parse_failure_fraction": 0.03333333333333333,
+          "eval/AIME_2025/grader_timeouts": 0,
+          "eval/AIME_2024/avg_at_8": 0.19166666666666668,
+          "eval/completions": 800,
+          "eval/AIME_2024/cap_hit_fraction": 0.0375,
+          "eval/AIME_2025/completions": 240,
+          "eval/AMC23/grader_timeouts": 0,
+          "eval/AMC23/completions": 320,
+          "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+          "eval/step": 3,
+          "eval/AMC23/parse_failure_fraction": 0.009375,
+          "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2024/completions": 240,
+          "eval/AMC23/avg_at_8": 0.58125
+        }
+      },
+      "B11": {
+        "1": {
+          "eval/AIME_2025/parse_failure_fraction": 0.041666666666666664,
+          "eval/AIME_2024/cap_hit_fraction": 0.0625,
+          "eval/AMC23/parse_failure_fraction": 0,
+          "eval/AIME_2024/completions": 240,
+          "eval/AIME_2024/parse_failure_fraction": 0.05,
+          "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/avg_at_8": 0.15,
+          "eval/completions": 800,
+          "eval/AIME_2024/grader_timeouts": 0,
+          "eval/AMC23/avg_at_8": 0.634375,
+          "eval/output_tokens_per_second": 9114.137850353385,
+          "eval/AMC23/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/grader_timeouts": 0,
+          "eval/AIME_2025/cap_hit_fraction": 0.06666666666666667,
+          "eval/AMC23/completions": 320,
+          "eval/AIME_2024/avg_at_8": 0.19166666666666668,
+          "eval/mean_response_tokens": 2287.57,
+          "eval/responses_per_second": 3.984200636637736,
+          "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/completions": 240,
+          "eval/AMC23/cap_hit_fraction": 0.015625,
+          "eval/step": 1,
+          "eval/AMC23/grader_timeouts": 0
+        },
+        "2": {
+          "eval/AIME_2025/parse_failure_fraction": 0.05,
+          "eval/AIME_2024/cap_hit_fraction": 0.12083333333333333,
+          "eval/AMC23/parse_failure_fraction": 0.003125,
+          "eval/AIME_2024/completions": 240,
+          "eval/AIME_2024/parse_failure_fraction": 0.10833333333333334,
+          "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/avg_at_8": 0.17916666666666667,
+          "eval/completions": 800,
+          "eval/AIME_2024/grader_timeouts": 0,
+          "eval/AMC23/avg_at_8": 0.65,
+          "eval/output_tokens_per_second": 8813.190980660576,
+          "eval/AMC23/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/grader_timeouts": 0,
+          "eval/AIME_2025/cap_hit_fraction": 0.07083333333333333,
+          "eval/AMC23/completions": 320,
+          "eval/AIME_2024/avg_at_8": 0.18333333333333332,
+          "eval/mean_response_tokens": 2599.60875,
+          "eval/responses_per_second": 3.3901989984687413,
+          "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/completions": 240,
+          "eval/AMC23/cap_hit_fraction": 0.00625,
+          "eval/step": 2,
+          "eval/AMC23/grader_timeouts": 0
+        },
+        "3": {
+          "eval/AIME_2025/parse_failure_fraction": 0.041666666666666664,
+          "eval/AIME_2024/cap_hit_fraction": 0.1125,
+          "eval/AMC23/parse_failure_fraction": 0.00625,
+          "eval/AIME_2024/completions": 240,
+          "eval/AIME_2024/parse_failure_fraction": 0.0875,
+          "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/avg_at_8": 0.17916666666666667,
+          "eval/completions": 800,
+          "eval/AIME_2024/grader_timeouts": 0,
+          "eval/AMC23/avg_at_8": 0.63125,
+          "eval/output_tokens_per_second": 9110.212244784085,
+          "eval/AMC23/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/grader_timeouts": 0,
+          "eval/AIME_2025/cap_hit_fraction": 0.05,
+          "eval/AMC23/completions": 320,
+          "eval/AIME_2024/avg_at_8": 0.22083333333333333,
+          "eval/mean_response_tokens": 2605.01125,
+          "eval/responses_per_second": 3.497187294213829,
+          "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/completions": 240,
+          "eval/AMC23/cap_hit_fraction": 0.015625,
+          "eval/step": 3,
+          "eval/AMC23/grader_timeouts": 0
+        }
+      },
+      "BS": {
+        "1": {
+          "eval/AIME_2025/avg_at_8": 0.15,
+          "eval/AMC23/avg_at_8": 0.615625,
+          "eval/AMC23/unexpected_thinking_delimiters": 0,
+          "eval/AMC23/grader_timeouts": 0,
+          "eval/AMC23/cap_hit_fraction": 0.00625,
+          "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/grader_timeouts": 0,
+          "eval/AIME_2025/cap_hit_fraction": 0.0625,
+          "eval/AIME_2024/grader_timeouts": 0,
+          "eval/AMC23/completions": 320,
+          "eval/AIME_2024/avg_at_8": 0.17916666666666667,
+          "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+          "eval/output_tokens_per_second": 8519.61413568014,
+          "eval/completions": 800,
+          "eval/AIME_2025/completions": 240,
+          "eval/AIME_2025/parse_failure_fraction": 0.05,
+          "eval/responses_per_second": 3.835573464769265,
+          "eval/step": 1,
+          "eval/AMC23/parse_failure_fraction": 0.00625,
+          "eval/mean_response_tokens": 2221.21,
+          "eval/AIME_2024/completions": 240,
+          "eval/AIME_2024/cap_hit_fraction": 0.075,
+          "eval/AIME_2024/parse_failure_fraction": 0.058333333333333334
+        },
+        "2": {
+          "eval/AIME_2025/avg_at_8": 0.14583333333333334,
+          "eval/AMC23/avg_at_8": 0.5625,
+          "eval/AMC23/unexpected_thinking_delimiters": 0,
+          "eval/AMC23/grader_timeouts": 0,
+          "eval/AMC23/cap_hit_fraction": 0,
+          "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/grader_timeouts": 0,
+          "eval/AIME_2025/cap_hit_fraction": 0.020833333333333332,
+          "eval/AIME_2024/grader_timeouts": 0,
+          "eval/AMC23/completions": 320,
+          "eval/AIME_2024/avg_at_8": 0.175,
+          "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+          "eval/output_tokens_per_second": 7782.559284159545,
+          "eval/completions": 800,
+          "eval/AIME_2025/completions": 240,
+          "eval/AIME_2025/parse_failure_fraction": 0.0125,
+          "eval/responses_per_second": 4.508596702599728,
+          "eval/step": 2,
+          "eval/AMC23/parse_failure_fraction": 0,
+          "eval/mean_response_tokens": 1726.16,
+          "eval/AIME_2024/completions": 240,
+          "eval/AIME_2024/cap_hit_fraction": 0.04583333333333333,
+          "eval/AIME_2024/parse_failure_fraction": 0.041666666666666664
+        },
+        "3": {
+          "eval/AIME_2025/avg_at_8": 0.14583333333333334,
+          "eval/AMC23/avg_at_8": 0.559375,
+          "eval/AMC23/unexpected_thinking_delimiters": 0,
+          "eval/AMC23/grader_timeouts": 0,
+          "eval/AMC23/cap_hit_fraction": 0.00625,
+          "eval/AIME_2025/unexpected_thinking_delimiters": 0,
+          "eval/AIME_2025/grader_timeouts": 0,
+          "eval/AIME_2025/cap_hit_fraction": 0.041666666666666664,
+          "eval/AIME_2024/grader_timeouts": 0,
+          "eval/AMC23/completions": 320,
+          "eval/AIME_2024/avg_at_8": 0.15833333333333333,
+          "eval/AIME_2024/unexpected_thinking_delimiters": 0,
+          "eval/output_tokens_per_second": 7451.355687329273,
+          "eval/completions": 800,
+          "eval/AIME_2025/completions": 240,
+          "eval/AIME_2025/parse_failure_fraction": 0.03333333333333333,
+          "eval/responses_per_second": 4.101912994617851,
+          "eval/step": 3,
+          "eval/AMC23/parse_failure_fraction": 0.00625,
+          "eval/mean_response_tokens": 1816.55625,
+          "eval/AIME_2024/completions": 240,
+          "eval/AIME_2024/cap_hit_fraction": 0.05416666666666667,
+          "eval/AIME_2024/parse_failure_fraction": 0.0375
+        }
+      }
+    },
+    "warmed_baseline": {
+      "AIME 2024": {
+        "avg_at_8": 0.18333333333333332,
+        "completions": 240,
+        "cap_hit_fraction": 0.0625,
+        "parse_failure_fraction": 0.05,
+        "grader_timeouts": 0,
+        "unexpected_thinking_delimiters": 0
+      },
+      "AIME 2025": {
+        "avg_at_8": 0.1375,
+        "completions": 240,
+        "cap_hit_fraction": 0.0625,
+        "parse_failure_fraction": 0.05416666666666667,
+        "grader_timeouts": 0,
+        "unexpected_thinking_delimiters": 0
+      },
+      "AMC23": {
+        "avg_at_8": 0.621875,
+        "completions": 320,
+        "cap_hit_fraction": 0.00625,
+        "parse_failure_fraction": 0.00625,
+        "grader_timeouts": 0,
+        "unexpected_thinking_delimiters": 0
+      }
+    },
+    "base_baseline": {
+      "AIME 2024": {
+        "avg_at_8": 0.2125,
+        "completions": 240,
+        "cap_hit_fraction": 0.12916666666666668,
+        "parse_failure_fraction": 0.11666666666666667,
+        "grader_timeouts": 0,
+        "unexpected_thinking_delimiters": 0
+      },
+      "AIME 2025": {
+        "avg_at_8": 0.20416666666666666,
+        "completions": 240,
+        "cap_hit_fraction": 0.09166666666666666,
+        "parse_failure_fraction": 0.07916666666666666,
+        "grader_timeouts": 0,
+        "unexpected_thinking_delimiters": 0
+      },
+      "AMC23": {
+        "avg_at_8": 0.671875,
+        "completions": 320,
+        "cap_hit_fraction": 0.0375,
+        "parse_failure_fraction": 0.028125,
+        "grader_timeouts": 0,
+        "unexpected_thinking_delimiters": 0
+      }
+    },
+    "interpretation": "Early diagnostic checkpoint-reversion signal; no established PI-only gain. The predefined two-block step-four comparison and shared PI feature pass remain incomplete."
+  },
+  "two_block_comparison": {
+    "basis": "step_four_equal_mean_of_two_reset_matched_blocks",
+    "eval_sampling": {
+      "temperature": 0.7,
+      "top_p": 0.8,
+      "top_k": 20,
+      "min_p": 0,
+      "response_cap": 16384,
+      "samples_per_question": 8,
+      "thinking": false,
+      "pi": false
+    },
+    "baseline": {
+      "base": {
+        "metrics": {
+          "AIME 2024": {
+            "avg_at_8": 0.2125,
+            "completions": 240,
+            "cap_hit_fraction": 0.12916666666666668,
+            "parse_failure_fraction": 0.11666666666666667,
+            "grader_timeouts": 0,
+            "unexpected_thinking_delimiters": 0
+          },
+          "AIME 2025": {
+            "avg_at_8": 0.20416666666666666,
+            "completions": 240,
+            "cap_hit_fraction": 0.09166666666666666,
+            "parse_failure_fraction": 0.07916666666666666,
+            "grader_timeouts": 0,
+            "unexpected_thinking_delimiters": 0
+          },
+          "AMC23": {
+            "avg_at_8": 0.671875,
+            "completions": 320,
+            "cap_hit_fraction": 0.0375,
+            "parse_failure_fraction": 0.028125,
+            "grader_timeouts": 0,
+            "unexpected_thinking_delimiters": 0
+          }
+        },
+        "mean_response_tokens": 3470.27125
+      },
+      "warm": {
+        "metrics": {
+          "AIME 2024": {
+            "avg_at_8": 0.18333333333333332,
+            "completions": 240,
+            "cap_hit_fraction": 0.0625,
+            "parse_failure_fraction": 0.05,
+            "grader_timeouts": 0,
+            "unexpected_thinking_delimiters": 0
+          },
+          "AIME 2025": {
+            "avg_at_8": 0.1375,
+            "completions": 240,
+            "cap_hit_fraction": 0.0625,
+            "parse_failure_fraction": 0.05416666666666667,
+            "grader_timeouts": 0,
+            "unexpected_thinking_delimiters": 0
+          },
+          "AMC23": {
+            "avg_at_8": 0.621875,
+            "completions": 320,
+            "cap_hit_fraction": 0.00625,
+            "parse_failure_fraction": 0.00625,
+            "grader_timeouts": 0,
+            "unexpected_thinking_delimiters": 0
+          }
+        },
+        "mean_response_tokens": 2201.70625
+      }
+    },
+    "arms": {
+      "B01": {
+        "metrics": {
+          "AIME 2024": {
+            "avg_at_8": 0.26458333333333334,
+            "cap_hit_fraction": 0.22499999999999998,
+            "parse_failure_fraction": 0.19583333333333333
+          },
+          "AIME 2025": {
+            "avg_at_8": 0.24375,
+            "cap_hit_fraction": 0.17291666666666666,
+            "parse_failure_fraction": 0.14166666666666666
+          },
+          "AMC23": {
+            "avg_at_8": 0.6984375,
+            "cap_hit_fraction": 0.028125,
+            "parse_failure_fraction": 0.0234375
+          }
+        },
+        "mean_response_tokens": 4778.984375,
+        "evaluation_generation_seconds_mean": 348.131249166996,
+        "block_scores": [
+          [
+            0.275,
+            0.24583333333333332,
+            0.7125
+          ],
+          [
+            0.25416666666666665,
+            0.24166666666666667,
+            0.684375
+          ]
+        ]
+      },
+      "B10": {
+        "metrics": {
+          "AIME 2024": {
+            "avg_at_8": 0.11666666666666667,
+            "cap_hit_fraction": 0.020833333333333336,
+            "parse_failure_fraction": 0.020833333333333336
+          },
+          "AIME 2025": {
+            "avg_at_8": 0.08958333333333332,
+            "cap_hit_fraction": 0.00625,
+            "parse_failure_fraction": 0.004166666666666667
+          },
+          "AMC23": {
+            "avg_at_8": 0.534375,
+            "cap_hit_fraction": 0.0015625,
+            "parse_failure_fraction": 0.0015625
+          }
+        },
+        "mean_response_tokens": 1083.339375,
+        "evaluation_generation_seconds_mean": 163.46540893150086,
+        "block_scores": [
+          [
+            0.12083333333333333,
+            0.09166666666666666,
+            0.55625
+          ],
+          [
+            0.1125,
+            0.0875,
+            0.5125
+          ]
+        ]
+      },
+      "B11": {
+        "metrics": {
+          "AIME 2024": {
+            "avg_at_8": 0.20416666666666666,
+            "cap_hit_fraction": 0.18958333333333333,
+            "parse_failure_fraction": 0.16666666666666669
+          },
+          "AIME 2025": {
+            "avg_at_8": 0.17291666666666666,
+            "cap_hit_fraction": 0.14583333333333331,
+            "parse_failure_fraction": 0.1
+          },
+          "AMC23": {
+            "avg_at_8": 0.653125,
+            "cap_hit_fraction": 0.03125,
+            "parse_failure_fraction": 0.0234375
+          }
+        },
+        "mean_response_tokens": 3496.0325000000003,
+        "evaluation_generation_seconds_mean": 272.64344098750735,
+        "block_scores": [
+          [
+            0.19166666666666668,
+            0.175,
+            0.640625
+          ],
+          [
+            0.21666666666666667,
+            0.17083333333333334,
+            0.665625
+          ]
+        ]
+      },
+      "BS": {
+        "metrics": {
+          "AIME 2024": {
+            "avg_at_8": 0.1125,
+            "cap_hit_fraction": 0.016666666666666666,
+            "parse_failure_fraction": 0.016666666666666666
+          },
+          "AIME 2025": {
+            "avg_at_8": 0.0875,
+            "cap_hit_fraction": 0.004166666666666667,
+            "parse_failure_fraction": 0.004166666666666667
+          },
+          "AMC23": {
+            "avg_at_8": 0.54375,
+            "cap_hit_fraction": 0.0015625,
+            "parse_failure_fraction": 0.0015625
+          }
+        },
+        "mean_response_tokens": 1072.2275,
+        "evaluation_generation_seconds_mean": 149.89067692498793,
+        "block_scores": [
+          [
+            0.11666666666666667,
+            0.075,
+            0.575
+          ],
+          [
+            0.10833333333333334,
+            0.1,
+            0.5125
+          ]
+        ]
+      }
+    },
+    "contrasts": {
+      "B01-B00": {
+        "AIME 2024": {
+          "mean_pp": 8.125,
+          "block_pp": [
+            9.166666666666666,
+            7.083333333333333
+          ],
+          "paired_block_question_percentile_95_pp": [
+            2.7083333333333335,
+            14.583333333333334
+          ],
+          "question_only_percentile_95_pp": [
+            2.9166666666666665,
+            13.958333333333334
+          ],
+          "block_only_percentile_95_pp": [
+            7.083333333333333,
+            9.166666666666666
+          ]
+        },
+        "AIME 2025": {
+          "mean_pp": 10.625,
+          "block_pp": [
+            10.833333333333334,
+            10.416666666666668
+          ],
+          "paired_block_question_percentile_95_pp": [
+            5.0,
+            17.083333333333332
+          ],
+          "question_only_percentile_95_pp": [
+            5.0,
+            16.666666666666664
+          ],
+          "block_only_percentile_95_pp": [
+            10.416666666666668,
+            10.833333333333334
+          ]
+        },
+        "AMC23": {
+          "mean_pp": 7.656250000000001,
+          "block_pp": [
+            9.0625,
+            6.25
+          ],
+          "paired_block_question_percentile_95_pp": [
+            2.1875,
+            13.750000000000002
+          ],
+          "question_only_percentile_95_pp": [
+            2.65625,
+            12.968750000000002
+          ],
+          "block_only_percentile_95_pp": [
+            6.25,
+            9.0625
+          ]
+        }
+      },
+      "B11-B00": {
+        "AIME 2024": {
+          "mean_pp": 2.083333333333333,
+          "block_pp": [
+            0.8333333333333334,
+            3.3333333333333335
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -3.3333333333333335,
+            7.5
+          ],
+          "question_only_percentile_95_pp": [
+            -2.7083333333333335,
+            7.083333333333333
+          ],
+          "block_only_percentile_95_pp": [
+            0.8333333333333334,
+            3.3333333333333335
+          ]
+        },
+        "AIME 2025": {
+          "mean_pp": 3.5416666666666665,
+          "block_pp": [
+            3.75,
+            3.3333333333333335
+          ],
+          "paired_block_question_percentile_95_pp": [
+            0.0,
+            7.5
+          ],
+          "question_only_percentile_95_pp": [
+            0.8333333333333334,
+            6.666666666666667
+          ],
+          "block_only_percentile_95_pp": [
+            3.3333333333333335,
+            3.75
+          ]
+        },
+        "AMC23": {
+          "mean_pp": 3.125,
+          "block_pp": [
+            1.875,
+            4.375
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -1.875,
+            8.125
+          ],
+          "question_only_percentile_95_pp": [
+            -1.5625,
+            7.5
+          ],
+          "block_only_percentile_95_pp": [
+            1.875,
+            4.375
+          ]
+        }
+      },
+      "B11-B01": {
+        "AIME 2024": {
+          "mean_pp": -6.041666666666667,
+          "block_pp": [
+            -8.333333333333332,
+            -3.75
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -12.5,
+            -0.8333333333333334
+          ],
+          "question_only_percentile_95_pp": [
+            -10.833333333333334,
+            -2.2916666666666665
+          ],
+          "block_only_percentile_95_pp": [
+            -8.333333333333332,
+            -3.75
+          ]
+        },
+        "AIME 2025": {
+          "mean_pp": -7.083333333333333,
+          "block_pp": [
+            -7.083333333333333,
+            -7.083333333333333
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -12.708333333333332,
+            -1.875
+          ],
+          "question_only_percentile_95_pp": [
+            -12.083333333333334,
+            -2.5
+          ],
+          "block_only_percentile_95_pp": [
+            -7.083333333333333,
+            -7.083333333333333
+          ]
+        },
+        "AMC23": {
+          "mean_pp": -4.53125,
+          "block_pp": [
+            -7.187499999999999,
+            -1.875
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -10.9375,
+            0.9375
+          ],
+          "question_only_percentile_95_pp": [
+            -8.90625,
+            -0.3125
+          ],
+          "block_only_percentile_95_pp": [
+            -7.187499999999999,
+            -1.875
+          ]
+        }
+      },
+      "B10-B00": {
+        "AIME 2024": {
+          "mean_pp": -6.666666666666667,
+          "block_pp": [
+            -6.25,
+            -7.083333333333333
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -12.083333333333334,
+            -2.083333333333333
+          ],
+          "question_only_percentile_95_pp": [
+            -11.875,
+            -2.2916666666666665
+          ],
+          "block_only_percentile_95_pp": [
+            -7.083333333333333,
+            -6.25
+          ]
+        },
+        "AIME 2025": {
+          "mean_pp": -4.791666666666667,
+          "block_pp": [
+            -4.583333333333333,
+            -5.0
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -10.208333333333334,
+            0.20833333333333334
+          ],
+          "question_only_percentile_95_pp": [
+            -10.0,
+            -0.20833333333333334
+          ],
+          "block_only_percentile_95_pp": [
+            -5.0,
+            -4.583333333333333
+          ]
+        },
+        "AMC23": {
+          "mean_pp": -8.75,
+          "block_pp": [
+            -6.5625,
+            -10.9375
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -15.312500000000002,
+            -1.875
+          ],
+          "question_only_percentile_95_pp": [
+            -14.531250000000002,
+            -3.5937499999999996
+          ],
+          "block_only_percentile_95_pp": [
+            -10.9375,
+            -6.5625
+          ]
+        }
+      },
+      "BS-B00": {
+        "AIME 2024": {
+          "mean_pp": -7.083333333333333,
+          "block_pp": [
+            -6.666666666666667,
+            -7.5
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -12.916666666666668,
+            -2.083333333333333
+          ],
+          "question_only_percentile_95_pp": [
+            -12.5,
+            -2.5
+          ],
+          "block_only_percentile_95_pp": [
+            -7.5,
+            -6.666666666666667
+          ]
+        },
+        "AIME 2025": {
+          "mean_pp": -5.0,
+          "block_pp": [
+            -6.25,
+            -3.75
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -10.833333333333334,
+            0.4166666666666667
+          ],
+          "question_only_percentile_95_pp": [
+            -10.416666666666668,
+            -0.4166666666666667
+          ],
+          "block_only_percentile_95_pp": [
+            -6.25,
+            -3.75
+          ]
+        },
+        "AMC23": {
+          "mean_pp": -7.8125,
+          "block_pp": [
+            -4.6875,
+            -10.9375
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -15.0,
+            -0.3125
+          ],
+          "question_only_percentile_95_pp": [
+            -13.593749999999998,
+            -2.34375
+          ],
+          "block_only_percentile_95_pp": [
+            -10.9375,
+            -4.6875
+          ]
+        }
+      },
+      "B10-B11": {
+        "AIME 2024": {
+          "mean_pp": -8.75,
+          "block_pp": [
+            -7.083333333333333,
+            -10.416666666666668
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -17.5,
+            -2.083333333333333
+          ],
+          "question_only_percentile_95_pp": [
+            -16.875,
+            -2.2916666666666665
+          ],
+          "block_only_percentile_95_pp": [
+            -10.416666666666668,
+            -7.083333333333333
+          ]
+        },
+        "AIME 2025": {
+          "mean_pp": -8.333333333333332,
+          "block_pp": [
+            -8.333333333333332,
+            -8.333333333333332
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -15.416666666666668,
+            -2.5
+          ],
+          "question_only_percentile_95_pp": [
+            -14.374999999999998,
+            -3.3333333333333335
+          ],
+          "block_only_percentile_95_pp": [
+            -8.333333333333332,
+            -8.333333333333332
+          ]
+        },
+        "AMC23": {
+          "mean_pp": -11.875,
+          "block_pp": [
+            -8.4375,
+            -15.312500000000002
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -19.6875,
+            -4.0625
+          ],
+          "question_only_percentile_95_pp": [
+            -17.5,
+            -6.71875
+          ],
+          "block_only_percentile_95_pp": [
+            -15.312500000000002,
+            -8.4375
+          ]
+        }
+      },
+      "BS-B11": {
+        "AIME 2024": {
+          "mean_pp": -9.166666666666666,
+          "block_pp": [
+            -7.5,
+            -10.833333333333334
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -16.666666666666664,
+            -2.5
+          ],
+          "question_only_percentile_95_pp": [
+            -16.25,
+            -3.125
+          ],
+          "block_only_percentile_95_pp": [
+            -10.833333333333334,
+            -7.5
+          ]
+        },
+        "AIME 2025": {
+          "mean_pp": -8.541666666666666,
+          "block_pp": [
+            -10.0,
+            -7.083333333333333
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -15.833333333333332,
+            -2.083333333333333
+          ],
+          "question_only_percentile_95_pp": [
+            -15.0,
+            -2.9166666666666665
+          ],
+          "block_only_percentile_95_pp": [
+            -10.0,
+            -7.083333333333333
+          ]
+        },
+        "AMC23": {
+          "mean_pp": -10.9375,
+          "block_pp": [
+            -6.5625,
+            -15.312500000000002
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -19.0625,
+            -3.125
+          ],
+          "question_only_percentile_95_pp": [
+            -15.78125,
+            -6.406249999999999
+          ],
+          "block_only_percentile_95_pp": [
+            -15.312500000000002,
+            -6.5625
+          ]
+        }
+      },
+      "interaction": {
+        "AIME 2024": {
+          "mean_pp": 0.625,
+          "block_pp": [
+            -2.083333333333333,
+            3.3333333333333335
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -5.833333333333333,
+            8.333333333333332
+          ],
+          "question_only_percentile_95_pp": [
+            -4.375,
+            6.458333333333334
+          ],
+          "block_only_percentile_95_pp": [
+            -2.083333333333333,
+            3.3333333333333335
+          ]
+        },
+        "AIME 2025": {
+          "mean_pp": -2.2916666666666665,
+          "block_pp": [
+            -2.5,
+            -2.083333333333333
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -8.333333333333332,
+            4.166666666666666
+          ],
+          "question_only_percentile_95_pp": [
+            -7.291666666666667,
+            2.5
+          ],
+          "block_only_percentile_95_pp": [
+            -2.5,
+            -2.083333333333333
+          ]
+        },
+        "AMC23": {
+          "mean_pp": 4.21875,
+          "block_pp": [
+            -0.625,
+            9.0625
+          ],
+          "paired_block_question_percentile_95_pp": [
+            -6.875000000000001,
+            14.0625
+          ],
+          "question_only_percentile_95_pp": [
+            -2.8125,
+            11.71875
+          ],
+          "block_only_percentile_95_pp": [
+            -0.625,
+            9.0625
+          ]
+        }
+      }
+    },
+    "bootstrap": {
+      "replicates": 20000,
+      "seed": 1709,
+      "interpretation": "Descriptive percentile sensitivity only. Two blocks are insufficient for reliable training variability; no confirmatory or optional-stopping-valid significance."
+    },
+    "verified_at_utc": "2026-10-09T21:19:54.926868+00:00",
+    "verified_evaluations_including_recovery": 44,
+    "all_gpu_workers_released": true,
+    "curves": {
+      "B01-r5-block-00": {
+        "1": {
+          "AIME 2024": 0.1875,
+          "AIME 2025": 0.19583333333333333,
+          "AMC23": 0.640625
+        },
+        "2": {
+          "AIME 2024": 0.21666666666666667,
+          "AIME 2025": 0.2125,
+          "AMC23": 0.684375
+        },
+        "3": {
+          "AIME 2024": 0.23333333333333334,
+          "AIME 2025": 0.1875,
+          "AMC23": 0.696875
+        },
+        "4": {
+          "AIME 2024": 0.275,
+          "AIME 2025": 0.24583333333333332,
+          "AMC23": 0.7125
+        }
+      },
+      "B01-r5-block-01": {
+        "1": {
+          "AIME 2024": 0.20833333333333334,
+          "AIME 2025": 0.17916666666666667,
+          "AMC23": 0.65
+        },
+        "2": {
+          "AIME 2024": 0.23333333333333334,
+          "AIME 2025": 0.20416666666666666,
+          "AMC23": 0.6625
+        },
+        "3": {
+          "AIME 2024": 0.20416666666666666,
+          "AIME 2025": 0.16666666666666666,
+          "AMC23": 0.6625
+        },
+        "4": {
+          "AIME 2024": 0.25416666666666665,
+          "AIME 2025": 0.24166666666666667,
+          "AMC23": 0.684375
+        }
+      },
+      "B10-r5-block-00": {
+        "1": {
+          "AIME 2024": 0.17916666666666667,
+          "AIME 2025": 0.1625,
+          "AMC23": 0.6375
+        },
+        "2": {
+          "AIME 2024": 0.1625,
+          "AIME 2025": 0.14166666666666666,
+          "AMC23": 0.6125
+        },
+        "3": {
+          "AIME 2024": 0.16666666666666666,
+          "AIME 2025": 0.12083333333333333,
+          "AMC23": 0.6125
+        },
+        "4": {
+          "AIME 2024": 0.12083333333333333,
+          "AIME 2025": 0.09166666666666666,
+          "AMC23": 0.55625
+        }
+      },
+      "B10-r5-block-01": {
+        "1": {
+          "AIME 2024": 0.19583333333333333,
+          "AIME 2025": 0.15833333333333333,
+          "AMC23": 0.63125
+        },
+        "2": {
+          "AIME 2024": 0.1875,
+          "AIME 2025": 0.12083333333333333,
+          "AMC23": 0.61875
+        },
+        "3": {
+          "AIME 2024": 0.175,
+          "AIME 2025": 0.1375,
+          "AMC23": 0.59375
+        },
+        "4": {
+          "AIME 2024": 0.1125,
+          "AIME 2025": 0.0875,
+          "AMC23": 0.5125
+        }
+      },
+      "B11-r5-block-00": {
+        "1": {
+          "AIME 2024": 0.1625,
+          "AIME 2025": 0.1875,
+          "AMC23": 0.61875
+        },
+        "2": {
+          "AIME 2024": 0.21666666666666667,
+          "AIME 2025": 0.1625,
+          "AMC23": 0.65
+        },
+        "3": {
+          "AIME 2024": 0.20833333333333334,
+          "AIME 2025": 0.19166666666666668,
+          "AMC23": 0.63125
+        },
+        "4": {
+          "AIME 2024": 0.19166666666666668,
+          "AIME 2025": 0.175,
+          "AMC23": 0.640625
+        }
+      },
+      "B11-r5-block-01": {
+        "1": {
+          "AIME 2024": 0.2,
+          "AIME 2025": 0.14583333333333334,
+          "AMC23": 0.6125
+        },
+        "2": {
+          "AIME 2024": 0.1875,
+          "AIME 2025": 0.175,
+          "AMC23": 0.65
+        },
+        "3": {
+          "AIME 2024": 0.19583333333333333,
+          "AIME 2025": 0.15833333333333333,
+          "AMC23": 0.615625
+        },
+        "4": {
+          "AIME 2024": 0.21666666666666667,
+          "AIME 2025": 0.17083333333333334,
+          "AMC23": 0.665625
+        }
+      },
+      "BS-r5-block-00": {
+        "1": {
+          "AIME 2024": 0.18333333333333332,
+          "AIME 2025": 0.14166666666666666,
+          "AMC23": 0.6375
+        },
+        "2": {
+          "AIME 2024": 0.16666666666666666,
+          "AIME 2025": 0.125,
+          "AMC23": 0.6
+        },
+        "3": {
+          "AIME 2024": 0.13333333333333333,
+          "AIME 2025": 0.12916666666666668,
+          "AMC23": 0.60625
+        },
+        "4": {
+          "AIME 2024": 0.11666666666666667,
+          "AIME 2025": 0.075,
+          "AMC23": 0.575
+        }
+      },
+      "BS-r5-block-01": {
+        "1": {
+          "AIME 2024": 0.1875,
+          "AIME 2025": 0.14166666666666666,
+          "AMC23": 0.6125
+        },
+        "2": {
+          "AIME 2024": 0.17083333333333334,
+          "AIME 2025": 0.15416666666666667,
+          "AMC23": 0.63125
+        },
+        "3": {
+          "AIME 2024": 0.14583333333333334,
+          "AIME 2025": 0.16666666666666666,
+          "AMC23": 0.559375
+        },
+        "4": {
+          "AIME 2024": 0.10833333333333334,
+          "AIME 2025": 0.1,
+          "AMC23": 0.5125
+        }
+      }
+    },
+    "finite_training_losses": {
+      "B01-r5-block-00": {
+        "1": 0.02219287119805813,
+        "2": 0.014792506583034992,
+        "3": 0.008447937667369843,
+        "4": 0.0035806982778012753
+      },
+      "B01-r5-block-01": {
+        "1": 0.014302928000688553,
+        "2": 0.02576664462685585,
+        "3": 0.013645704835653305,
+        "4": 0.005743859335780144
+      },
+      "B10-r5-block-00": {
+        "1": 0.1004326269030571,
+        "2": 0.12798865139484406,
+        "3": 0.2006058394908905,
+        "4": 0.10364636033773422
+      },
+      "B10-r5-block-01": {
+        "1": 0.08106544613838196,
+        "2": 0.15529340505599976,
+        "3": 0.1686762124300003,
+        "4": 0.20104527473449707
+      },
+      "B11-r5-block-00": {
+        "1": 0.05484228581190109,
+        "2": 0.049263693392276764,
+        "3": 0.05829953774809837,
+        "4": 0.03868476673960686
+      },
+      "B11-r5-block-01": {
+        "1": 0.032689258456230164,
+        "2": 0.05340881645679474,
+        "3": 0.060704126954078674,
+        "4": 0.05756678432226181
+      },
+      "BS-r5-block-00": {
+        "1": 0.04886435717344284,
+        "2": 0.04941541329026222,
+        "3": 0.06271830201148987,
+        "4": 0.05290791764855385
+      },
+      "BS-r5-block-01": {
+        "1": 0.036118946969509125,
+        "2": 0.05239183455705643,
+        "3": 0.04113512858748436,
+        "4": 0.0495707131922245
+      }
+    },
+    "known_controller_study_gpu_hours": 53.08183865388234,
+    "no_pi_versus_original_base": {
+      "AIME 2024": {
+        "mean_gain_pp": 5.208333333333334,
+        "block_gain_pp": [
+          6.25,
+          4.166666666666666
+        ],
+        "descriptive_paired_block_question_95_pp": [
+          0.8333333333333334,
+          10.0
+        ]
+      },
+      "AIME 2025": {
+        "mean_gain_pp": 3.958333333333333,
+        "block_gain_pp": [
+          4.166666666666666,
+          3.75
+        ],
+        "descriptive_paired_block_question_95_pp": [
+          -0.4166666666666667,
+          8.958333333333334
+        ]
+      },
+      "AMC23": {
+        "mean_gain_pp": 2.65625,
+        "block_gain_pp": [
+          4.0625,
+          1.25
+        ],
+        "descriptive_paired_block_question_95_pp": [
+          -2.1875,
+          7.8125
+        ]
+      }
+    }
+  }
+}

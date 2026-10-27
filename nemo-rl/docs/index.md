@@ -1,0 +1,415 @@
+# NeMo RL Documentation
+
+Welcome to the NeMo RL documentation. NeMo RL is an open-source post-training library developed by NVIDIA, designed to streamline and scale reinforcement learning methods for multimodal models (LLMs, VLMs, etc.).
+
+This documentation provides comprehensive guides, examples, and references to help you get started with NeMo RL and build powerful post-training pipelines for your models.
+
+## Getting Started
+
+::::{grid} 1 1 2 2
+:gutter: 3
+
+:::{grid-item-card} {octicon}`book` Overview
+:link: about/overview
+:link-type: doc
+
+Learn about NeMo RL's architecture, design philosophy, and key features that make it ideal for scalable reinforcement learning.
+:::
+
+:::{grid-item-card} {octicon}`rocket` Quick Start
+:link: about/quick-start
+:link-type: doc
+
+Get up and running quickly with examples for both Automodel and Megatron Core training backends.
+:::
+
+:::{grid-item-card} {octicon}`download` Installation
+:link: about/installation
+:link-type: doc
+
+Step-by-step instructions for installing NeMo RL, including prerequisites, system dependencies, and environment setup.
+:::
+
+:::{grid-item-card} {octicon}`star` Features
+:link: about/features
+:link-type: doc
+
+Explore the current features and upcoming enhancements in NeMo RL, including distributed training, advanced parallelism, and more.
+:::
+
+:::{grid-item-card} {octicon}`light-bulb` Tips and Tricks
+:link: about/tips-and-tricks
+:link-type: doc
+
+Troubleshooting common issues including missing submodules and memory fragmentation.
+:::
+
+::::
+
+## Training and Generation
+
+::::{grid} 1 1 2 2
+:gutter: 3
+
+:::{grid-item-card} {octicon}`cpu` Training Backends
+:link: about/backends
+:link-type: doc
+
+Learn about Automodel and Megatron Core training backends, their capabilities, and how to choose the right one for your use case.
+:::
+
+:::{grid-item-card} {octicon}`workflow` Algorithms
+:link: about/algorithms/index
+:link-type: doc
+
+Discover supported algorithms including GRPO, PPO, SFT, DPO, RM, on-policy distillation, and multi-teacher on-policy distillation (MOPD) with detailed guides and examples.
+:::
+
+:::{grid-item-card} {octicon}`graph` Evaluation
+:link: about/evaluation
+:link-type: doc
+
+Measure model and agent capabilities with repeatable benchmarks and custom evaluations.
+:::
+
+:::{grid-item-card} {octicon}`server` Cluster Setup
+:link: cluster
+:link-type: doc
+
+Configure and launch NeMo RL on multi-node Slurm or Kubernetes clusters for distributed computing.
+:::
+
+:::{grid-item-card} {octicon}`workflow` Managed Dynamo Generation
+:link: guides/dynamo-generation
+:link-type: doc
+
+Run a fixed Dynamo vLLM fleet with NCCL refit and W&B telemetry inside a Slurm Ray allocation.
+:::
+
+::::
+
+## Guides and Examples
+
+::::{grid} 1 1 2 2
+:gutter: 3
+
+:::{grid-item-card} {octicon}`mortar-board` GRPO DeepscaleR
+:link: guides/grpo-deepscaler
+:link-type: doc
+
+Reproduce DeepscaleR results with NeMo RL using GRPO on mathematical reasoning tasks.
+:::
+
+:::{grid-item-card} {octicon}`number` SFT on OpenMathInstruct2
+:link: guides/sft-openmathinstruct2
+:link-type: doc
+
+Step-by-step guide for supervised fine-tuning on the OpenMathInstruct2 dataset.
+:::
+
+:::{grid-item-card} {octicon}`rocket` Nemotron 3 Ultra
+:link: guides/models/nemotron/nemotron-3-ultra
+:link-type: doc
+
+Post-train Nemotron 3 Ultra with RLVR, teacher training, and MOPD stages on GB200 NVL72 hardware.
+:::
+
+:::{grid-item-card} {octicon}`stack` Environments
+:link: guides/environments
+:link-type: doc
+
+Create custom reward environments and integrate them with NeMo RL training pipelines.
+:::
+
+:::{grid-item-card} {octicon}`rocket` Eagle3 Speculative Decoding
+:link: guides/eagle3-speculative-decoding
+:link-type: doc
+
+Configure offline and online Eagle3 draft-model workflows to accelerate rollout generation with vLLM.
+:::
+
+:::{grid-item-card} {octicon}`rocket` Automodel Speculative Decoding
+:link: guides/automodel-speculative-decoding
+:link-type: doc
+
+Co-train DSpark, DFlash, and EAGLE3 drafters alongside the policy on the Automodel backend.
+:::
+
+:::{grid-item-card} {octicon}`unmute` Audio GRPO on AVQA
+:link: guides/grpo-audio
+:link-type: doc
+
+Train Qwen2.5-Omni-3B with GRPO on AVQA and evaluate on MMAU, following the R1-AQA approach.
+:::
+
+:::{grid-item-card} {octicon}`device-camera-video` Audio-Visual Intent GRPO
+:link: guides/grpo-audio-visual
+:link-type: doc
+
+Train Qwen2.5-Omni-7B with GRPO on PhilipC/IntentTrain (audio-visual intent recognition) and evaluate on Daily-Omni, following HumanOmniV2's joint audio-visual setup.
+:::
+
+:::{grid-item-card} {octicon}`terminal` Two-Stage SWE RL (Qwen3 Thinking)
+:link: guides/swe-rl-qwen3
+:link-type: doc
+
+Train Qwen3-30B-A3B-Thinking into a SWE agent with a pivot stage plus end-to-end agentic RL on SWE-bench.
+:::
+
+:::{grid-item-card} {octicon}`plus-circle` Adding New Models
+:link: adding-new-models
+:link-type: doc
+
+Learn how to add support for new model architectures in NeMo RL.
+:::
+
+:::{grid-item-card} {octicon}`pulse` LoRA
+:link: guides/lora
+:link-type: doc
+
+Parameter-efficient fine-tuning with LoRA: backend support, Automodel vs Megatron schema comparison, config examples, and recipes.
+:::
+
+:::{grid-item-card} {octicon}`arrow-both` YaRN Long-Context Training
+:link: guides/yarn-long-context
+:link-type: doc
+
+Extend a model's context window with YaRN RoPE scaling on the Megatron backend for SFT, GRPO, and other workflows.
+:::
+
+:::{grid-item-card} {octicon}`git-compare` Cross-Tokenizer Distillation
+:link: guides/xtoken-off-policy-distillation
+:link-type: doc
+
+Off-policy distillation across mismatched tokenizers — build a (student, teacher) projection matrix and run x-token KD via CUDA-IPC teacher logits.
+:::
+
+:::{grid-item-card} {octicon}`arrow-both` Weight Refit
+:link: guides/refit
+:link-type: doc
+
+Choose among colocated IPC, NCCL, sparse delta, and NIXL refit transports.
+:::
+
+:::{grid-item-card} {octicon}`sync` Checkpoint-Engine Refit
+:link: guides/checkpoint-engine-refit
+:link-type: doc
+
+Use NIXL checkpoint-engine refit to update non-colocated vLLM generation workers from policy workers.
+:::
+
+:::{grid-item-card} {octicon}`workflow` Single-Controller (Async GRPO and PPO)
+:link: guides/single-controller
+:link-type: doc
+
+Run async GRPO or PPO via the SingleController path: TransferQueue data plane, pluggable staleness samplers, and streaming trainer.
+:::
+
+::::
+
+## Advanced Topics
+
+::::{grid} 1 1 2 2
+:gutter: 3
+
+:::{grid-item-card} {octicon}`telescope` Design and Philosophy
+:link: design-docs/design-and-philosophy
+:link-type: doc
+
+Deep dive into NeMo RL's architecture, APIs, and design decisions for scalable RL.
+:::
+
+:::{grid-item-card} {octicon}`bug` Debugging
+:link: debugging
+:link-type: doc
+
+Tools and techniques for debugging distributed Ray applications and RL training runs.
+:::
+
+:::{grid-item-card} {octicon}`graph` Observability
+:link: observability/index
+:link-type: doc
+
+OpenTelemetry traces and `rl.*` metrics via nemo-lens: span groups, configuration, vLLM tracing, and an OTLP export stack.
+:::
+
+:::{grid-item-card} {octicon}`zap` FP8 Quantization
+:link: fp8
+:link-type: doc
+
+Optimize large language models with FP8 quantization for faster training and inference.
+:::
+
+:::{grid-item-card} {octicon}`package` Quantization-Aware RL
+:link: guides/quantization-aware-rl
+:link-type: doc
+
+Run quantized GRPO and distillation with NVIDIA ModelOpt.
+:::
+
+:::{grid-item-card} {octicon}`meter` End-to-End NVFP4 Training
+:link: design-docs/te-nvfp4-per-token-rollout
+:link-type: doc
+
+Run W4A4 policy training and per-token vLLM rollout on NVIDIA Blackwell GPUs.
+:::
+
+:::{grid-item-card} {octicon}`container` Docker Containers
+:link: docker
+:link-type: doc
+
+Build and use Docker containers for reproducible NeMo RL environments.
+:::
+
+::::
+
+## API Reference
+
+::::{grid} 1 1 1 1
+:gutter: 3
+
+:::{grid-item-card} {octicon}`code` Complete API Documentation
+:link: apidocs/index
+:link-type: doc
+
+Comprehensive reference for all NeMo RL modules, classes, functions, and methods. Browse the complete Python API with detailed docstrings and usage examples.
+:::
+
+::::
+
+## Full Documentation Index
+
+The complete table of contents below lists all pages, including guide, development, and design-doc pages that are not shown in the cards above.
+
+```{toctree}
+:caption: About
+
+about/overview
+about/performance-summary
+about/model-support
+about/features
+about/backends
+about/quick-start
+about/installation
+about/algorithms/index
+about/evaluation
+about/clusters
+about/tips-and-tricks
+```
+
+
+
+```{toctree}
+:caption: Environment Start
+
+local-workstation.md
+cluster.md
+
+```
+
+```{toctree}
+:caption: E2E Examples
+
+guides/sft-openmathinstruct2.md
+```
+
+```{toctree}
+:caption: Guides
+
+adding-new-models.md
+guides/sft.md
+guides/dpo.md
+guides/nemotron-omni-mpo.md
+guides/dapo.md
+guides/lora.md
+guides/cispo.md
+guides/prorlv2.md
+guides/swe-rl-qwen3.md
+guides/grpo.md
+guides/length-penalty.md
+guides/ppo.md
+guides/grpo-deepscaler.md
+guides/grpo-sliding-puzzle.md
+guides/grpo-audio.md
+guides/grpo-audio-visual.md
+guides/rm.md
+guides/environments.md
+guides/deepseek.md
+guides/models/index.md
+model-quirks.md
+guides/async-grpo.md
+guides/single-controller.md
+guides/quantization-aware-rl.md
+guides/eagle3-speculative-decoding.md
+guides/automodel-speculative-decoding.md
+guides/yarn-long-context.md
+guides/xtoken-off-policy-distillation.md
+guides/refit.md
+guides/checkpoint-engine-refit.md
+guides/dynamo-generation.md
+guides/router-replay.md
+guides/muon-optimizer.md
+guides/automodel-tp-accuracy.md
+guides/ft-launcher-guide.md
+```
+
+```{toctree}
+:caption: Containers
+
+docker.md
+```
+
+```{toctree}
+:caption: Development
+
+ci-cd.md
+testing.md
+documentation.md
+debugging.md
+nsys-profiling.md
+fp8.md
+guides/use-custom-vllm.md
+```
+
+```{toctree}
+:caption: Observability
+
+observability/index.md
+```
+
+```{toctree}
+:caption: Design Docs
+
+design-docs/design-and-philosophy.md
+design-docs/padding.md
+design-docs/logger.md
+design-docs/uv.md
+design-docs/dependency-management.md
+design-docs/chat-datasets.md
+design-docs/generation.md
+design-docs/ppo-colocated-streaming.md
+design-docs/pd-disaggregation-rollout.md
+design-docs/dynamo-integration.md
+design-docs/sparse-delta-refit.md
+design-docs/checkpoint-engines.md
+design-docs/checkpointing.md
+design-docs/loss-functions.md
+design-docs/automodel-parallel-plan.md
+design-docs/training-backends.md
+design-docs/sequence-packing-and-dynamic-batching.md
+design-docs/env-vars.md
+design-docs/nemo-gym-integration.md
+design-docs/modelopt-real-quant-architecture.md
+design-docs/te-nvfp4-per-token-rollout.md
+design-docs/nccl-reshard-refit.md
+design-docs/dspark-auxiliary-heads.md
+design-docs/media-token-validity-mask.md
+design-docs/automodel-context-parallel.md
+design-docs/token-capture-ledger.md
+```
+
+```{toctree}
+:caption: API Reference
+
+apidocs/index
+```

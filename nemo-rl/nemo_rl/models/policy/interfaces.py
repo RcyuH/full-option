@@ -1,0 +1,326 @@
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING, Any, Optional, TypedDict
+
+import ray
+import torch
+
+from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.utils.timer import Timer
+
+if TYPE_CHECKING:
+    from nemo_rl.models.policy import PolicyConfig
+
+
+class LogprobOutputSpec(TypedDict):
+    """Token log probabilities; filtered unsupported tokens retain -inf."""
+
+    logprobs: torch.Tensor
+
+
+class ReferenceLogprobOutputSpec(TypedDict):
+    """logprobs: Tensor of log probabilities."""
+
+    reference_logprobs: torch.Tensor
+
+
+class ScoreOutputSpec(TypedDict):
+    """scores: Tensor of scores."""
+
+    scores: torch.Tensor
+
+
+class TopkLogitsOutputSpec(TypedDict):
+    """Per-position top-k logits and corresponding global token indices."""
+
+    topk_logits: torch.Tensor
+    topk_indices: torch.Tensor
+
+
+class TeacherFullPayloadOutputSpec(TypedDict):
+    """Sampled-token logprobs plus the full-vocabulary MOPD teacher payload.
+
+    ``teacher_full_payload`` is ``[B, S, hidden_size]`` or ``[B, S, vocab_size]``
+    depending on ``on_policy_distillation.full.teacher_payload``. It is ``None``
+    off the last pipeline stage: the payload is far too large to broadcast, so
+    only the stage that produced it writes it back. It comes back on CPU --
+    each microbatch is moved off the device inside the forward schedule, which
+    is what bounds the resident payload to one microbatch.
+    """
+
+    logprobs: torch.Tensor
+    teacher_full_payload: Optional[torch.Tensor]
+
+
+class PolicyInterface(ABC):
+    """Abstract base class defining the interface for RL policies."""
+
+    @abstractmethod
+    def get_logprobs(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        timer: Optional[Timer] = None,
+    ) -> BatchedDataDict[LogprobOutputSpec]:
+        """Get logprobs of actions from observations.
+
+        Args:
+            data: BatchedDataDict containing rollouts (tokens)
+
+        Returns:
+            BatchedDataDict containing:
+                - ``logprobs``: Tensor of logprobs of actions
+        """
+        pass
+
+    @abstractmethod
+    def get_reference_policy_logprobs(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
+        """Get logprobs of actions from observations.
+
+        Args:
+            data: BatchedDataDict containing rollouts (tokens)
+
+        Returns:
+            BatchedDataDict containing:
+                - ``logprobs``: Tensor of logprobs of actions
+        """
+        pass
+
+    @abstractmethod
+    def get_topk_logits(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> BatchedDataDict[TopkLogitsOutputSpec]:
+        """Get per-position top-k logits and global indices for a batch of inputs.
+
+        Notes:
+            - Aligns to next-token positions → returns S-1 positions.
+        """
+        pass
+
+    @abstractmethod
+    def train(
+        self,
+        data: BatchedDataDict,
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        *,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        timer: Optional[Timer] = None,
+    ) -> dict[str, Any]:
+        """Train the policy on a global batch of data.
+
+        Args:
+            data: BatchedDataDict containing rollouts (tokens)
+            loss_fn: Loss function to use for training
+            eval_mode: Whether to run in evaluation mode (no gradient updates)
+            gbs: Global batch size override (if None, uses config default)
+            mbs: Micro batch size override (if None, uses config default)
+        """
+        pass
+
+    @abstractmethod
+    def calibrate_qkv_fp8_scales(
+        self,
+        data: BatchedDataDict[GenerationDatumSpec],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """Calibrate FP8 scales for Q/K/V activations used by KV cache.
+
+        Args:
+            data: BatchedDataDict containing input_ids and input_lengths.
+            micro_batch_size: Optional override for micro batch size during calibration.
+            percentile: Percentile for per-tensor amax estimation.
+            margin: Safety margin multiplier applied to amax.
+            include_q: Whether to also compute scale for Q in addition to K/V.
+
+        Returns:
+            Dict with overall configuration and per-layer scales.
+        """
+        pass
+
+    @abstractmethod
+    def prepare_for_training(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    @abstractmethod
+    def finish_training(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    @abstractmethod
+    def save_checkpoint(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    @abstractmethod
+    def shutdown(self) -> bool:
+        pass
+
+
+class ColocatablePolicyInterface(PolicyInterface):
+    cfg: "PolicyConfig"
+
+    @abstractmethod
+    def init_collective(
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
+        rank_offset: int = 0,
+        nccl_peer: str = "nemo",
+    ) -> list[ray.ObjectRef]:
+        pass
+
+    @abstractmethod
+    def sync_params_before_refit(self) -> None:
+        """Materialize the latest policy parameters before weight transfer."""
+        pass
+
+    @abstractmethod
+    def offload_before_refit(self) -> None:
+        pass
+
+    @abstractmethod
+    def offload_after_refit(self) -> None:
+        pass
+
+    def offload_to_cpu(self) -> None:
+        pass
+
+    @abstractmethod
+    def prepare_refit_info(self) -> Optional[dict[str, Any]]:
+        pass
+
+    def enable_refit_prequantize(
+        self, param_names: list[str]
+    ) -> Optional[dict[str, Any]]:
+        """Quantize the listed params on the trainer during refit streaming.
+
+        Returns:
+            Refit info updated with the quantized dtypes and scale entries.
+        """
+        raise NotImplementedError(
+            "enable_refit_prequantize is not implemented for this policy worker"
+        )
+
+    @abstractmethod
+    def stream_weights_via_ipc_zmq(
+        self,
+        buffer_size_bytes: int,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> list[ray.ObjectRef]:
+        pass
+
+    def connect_sglang_rollout_engines(
+        self,
+        *,
+        engine_gpu_counts: list[int],
+        engine_gpu_offsets: Optional[list[int]] = None,
+    ) -> None:
+        raise NotImplementedError(
+            "connect_sglang_rollout_engines is not implemented for this policy"
+        )
+
+    def update_weights_to_sglang_colocated(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
+        raise NotImplementedError(
+            "update_weights_to_sglang_colocated is not implemented for this policy"
+        )
+
+    def connect_sglang_rollout_engines_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        engine_gpu_counts: list[int],
+        group_name: Optional[str] = None,
+    ) -> None:
+        raise NotImplementedError(
+            "connect_sglang_rollout_engines_distributed is not implemented "
+            "for this policy"
+        )
+
+    def update_weights_to_sglang_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        rollout_engine_lock: ray.actor.ActorHandle,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
+        raise NotImplementedError(
+            "update_weights_to_sglang_distributed is not implemented for this policy"
+        )
+
+    @abstractmethod
+    def broadcast_weights_for_collective(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
+    ) -> list[ray.ObjectRef]:
+        pass
+
+    def prepare_nccl_reshard_refit_info(
+        self,
+        train_parallelism: dict[str, int],
+        gen_parallelism: dict[str, int],
+        train_world_size: int,
+        gen_world_size: int,
+    ) -> Any:
+        """Prepare per-layer param metadata for nccl_reshard-based refit."""
+        raise NotImplementedError
+
+    def nccl_reshard_refit(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
+    ) -> list[ray.ObjectRef]:
+        """Sync weights to generation workers via the NCCL-reshard path."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        """Put the policy in eval mode for logprob inference.
+
+        Args:
+            keep_train_buffers: Leave grad buffers and optimizer state on CUDA
+                because a train step is already open and its accumulated
+                gradients must survive this call.
+        """
+        pass

@@ -1,0 +1,461 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from unittest.mock import patch
+
+import pytest
+import torch
+
+from nemo_rl.utils.packed_tensor import (
+    packed_broadcast_consumer,
+    packed_broadcast_producer,
+)
+
+
+@pytest.mark.parametrize("buffer_size_bytes", [0, -1])
+def test_producer_rejects_nonpositive_buffer_size(buffer_size_bytes):
+    with pytest.raises(ValueError, match="buffer_size_bytes must be > 0"):
+        packed_broadcast_producer(
+            iterator=iter([]),
+            group=None,
+            src=0,
+            post_iter_func=lambda x: x,
+            buffer_size_bytes=buffer_size_bytes,
+        )
+
+
+class MockCommunicationGroup:
+    """Mock communication group for testing broadcast operations."""
+
+    def __init__(self):
+        self.broadcasted_tensors = []
+        self.broadcast_count = 0
+
+    def broadcast(self, tensor, src):
+        """Mock broadcast that stores the tensor for later verification."""
+        # Store a copy of the tensor
+        self.broadcasted_tensors.append(tensor.clone())
+        self.broadcast_count += 1
+
+
+class MockConsumerCommunicationGroup:
+    """Mock communication group for consumer that returns pre-stored tensors."""
+
+    def __init__(self, tensors_to_return):
+        self.tensors_to_return = tensors_to_return
+        self.current_index = 0
+
+    def broadcast(self, tensor, src):
+        """Mock broadcast that fills the tensor with pre-stored data."""
+        if self.current_index < len(self.tensors_to_return):
+            tensor.copy_(self.tensors_to_return[self.current_index])
+            self.current_index += 1
+
+
+def create_mock_model_params():
+    """Create mock model parameters for testing."""
+    params = [
+        ("layer1.weight", torch.randn(10, 20, dtype=torch.float32)),
+        ("layer1.bias", torch.randn(10, dtype=torch.float32)),
+        ("layer2.weight", torch.randn(20, 30, dtype=torch.float32)),
+        ("layer2.bias", torch.randn(20, dtype=torch.float32)),
+        ("layer3.weight", torch.randn(30, 40, dtype=torch.float16)),
+        ("kv_amax", torch.tensor(42.0, dtype=torch.bfloat16)),
+        ("transposed.weight", torch.randn(4, 5, dtype=torch.float32).T),
+    ]
+    return params
+
+
+def create_mock_state_dict_info(params):
+    """Create state dict info (name -> (shape, dtype)) from params."""
+    return {name: (tensor.shape, tensor.dtype) for name, tensor in params}
+
+
+def test_packed_broadcast_consumer_callback_is_eager(monkeypatch):
+    batches = [[("a", "a-value")], [("b", "b-value")]]
+    callbacks = []
+
+    monkeypatch.setattr(
+        "nemo_rl.utils.packed_tensor._packed_broadcast_consumer_batches",
+        lambda _iterator, _group, _src, **_kwargs: iter(batches),
+    )
+
+    result = packed_broadcast_consumer(
+        iterator=iter(()),
+        group=object(),
+        src=0,
+        post_unpack_func=callbacks.append,
+    )
+
+    assert result is None
+    assert callbacks == batches
+
+
+def test_packed_broadcast_consumer_returns_lazy_flattened_iterator(monkeypatch):
+    batches_started = []
+
+    def batches(_iterator, _group, _src, **_kwargs):
+        batches_started.append(True)
+        yield [("a", "a-value")]
+        yield [("b", "b-value")]
+
+    monkeypatch.setattr(
+        "nemo_rl.utils.packed_tensor._packed_broadcast_consumer_batches", batches
+    )
+
+    result = packed_broadcast_consumer(
+        iterator=iter(()),
+        group=object(),
+        src=0,
+        post_unpack_func=None,
+        return_iterator=True,
+    )
+
+    assert batches_started == []
+    assert result is not None
+    assert list(result) == [("a", "a-value"), ("b", "b-value")]
+    assert batches_started == [True]
+
+
+def test_packed_broadcast_consumer_closes_abandoned_lazy_batches(monkeypatch):
+    class CloseableBatches:
+        def __init__(self):
+            self.batches = iter([[("a", "a-value"), ("b", "b-value")]])
+            self.closed = False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self.batches)
+
+        def close(self):
+            self.closed = True
+
+    batches = CloseableBatches()
+    monkeypatch.setattr(
+        "nemo_rl.utils.packed_tensor._packed_broadcast_consumer_batches",
+        lambda _iterator, _group, _src, **_kwargs: batches,
+    )
+
+    result = packed_broadcast_consumer(
+        iterator=iter(()),
+        group=object(),
+        src=0,
+        post_unpack_func=None,
+        return_iterator=True,
+    )
+
+    assert result is not None
+    assert next(result) == ("a", "a-value")
+    assert batches.closed is False
+
+    result.close()
+
+    assert batches.closed is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.parametrize("return_iterator", [False, True])
+@pytest.mark.parametrize(
+    ("producer_num_buffers", "consumer_num_buffers"),
+    [(None, None), (2, 1)],
+)
+def test_packed_broadcast_producer_consumer_roundtrip(
+    producer_num_buffers, consumer_num_buffers, return_iterator
+):
+    """Test that producer and consumer work together correctly."""
+    # Create mock parameters
+    params = create_mock_model_params()
+
+    # Move params to CUDA
+    params_cuda = [(name, tensor.cuda()) for name, tensor in params]
+
+    # Create mock communication group for producer
+    producer_group = MockCommunicationGroup()
+
+    # Mock the target size to force packing
+    target_size = 2000
+    with patch(
+        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size",
+        return_value=target_size,
+    ):
+        # Post-iter function that just returns the tensor
+        post_iter_func = lambda x: x[1]
+
+        # Run producer
+        packed_broadcast_producer(
+            iterator=iter(params_cuda),
+            group=producer_group,
+            src=0,
+            post_iter_func=post_iter_func,
+            num_buffers=producer_num_buffers,
+        )
+
+        # Now test consumer with the broadcasted tensors
+        consumer_group = MockConsumerCommunicationGroup(
+            producer_group.broadcasted_tensors
+        )
+
+        # Create state dict info for consumer
+        state_dict_info = create_mock_state_dict_info(params_cuda)
+        for name in ("kv_amax", "transposed.weight"):
+            shape, dtype = state_dict_info[name]
+            state_dict_info[name] = (list(shape), dtype)
+
+        # Store unpacked tensors
+        unpacked_tensors = {}
+
+        def post_unpack_func(tensor_list):
+            """Store unpacked tensors for verification."""
+            for name, tensor in tensor_list:
+                unpacked_tensors[name] = tensor
+
+        # Run consumer
+        result = packed_broadcast_consumer(
+            iterator=iter(state_dict_info.items()),
+            group=consumer_group,
+            src=0,
+            post_unpack_func=None if return_iterator else post_unpack_func,
+            return_iterator=return_iterator,
+            num_buffers=consumer_num_buffers,
+        )
+        if return_iterator:
+            assert result is not None
+            for name, tensor in result:
+                unpacked_tensors[name] = tensor
+
+        # Target is 2000 B; the two 2400 B tensors are isolated in their own
+        # batches: [800+40], [2400], [80], [2400], [2+80].
+        assert consumer_group.current_index == 5
+
+    # Verify all parameters were unpacked
+    assert len(unpacked_tensors) == len(params)
+
+    # Verify each tensor matches the original
+    for name, original_tensor in params_cuda:
+        assert name in unpacked_tensors
+        unpacked = unpacked_tensors[name]
+
+        # Check shape and dtype
+        assert unpacked.shape == original_tensor.shape
+        assert unpacked.dtype == original_tensor.dtype
+
+        # Check values are close (accounting for floating point precision)
+        assert torch.allclose(unpacked, original_tensor, rtol=1e-5, atol=1e-7)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_single_large_tensor():
+    """Test with a single tensor larger than target size."""
+    # Create a large tensor
+    large_tensor = torch.randn(1000, 1000, dtype=torch.float32).cuda()
+    params = [("large_weight", large_tensor)]
+
+    # Create mock communication group
+    mock_group = MockCommunicationGroup()
+
+    # Small target size to force the tensor to exceed it
+    with patch(
+        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size", return_value=100
+    ):
+        packed_broadcast_producer(
+            iterator=iter(params),
+            group=mock_group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+        )
+
+    # Should still broadcast the tensor
+    assert mock_group.broadcast_count == 1
+    assert len(mock_group.broadcasted_tensors) == 1
+
+    # Verify the size matches the large tensor
+    expected_size = large_tensor.numel() * large_tensor.element_size()
+    assert mock_group.broadcasted_tensors[0].numel() == expected_size
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_isolates_large_tensor_after_small_tensor():
+    """An oversized tensor must not force a copy of the preceding prefix."""
+    params = [
+        ("small_weight", torch.randn(16, dtype=torch.float32).cuda()),
+        ("large_weight", torch.randn(100, dtype=torch.float32).cuda()),
+    ]
+    producer_group = MockCommunicationGroup()
+
+    with patch(
+        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size", return_value=100
+    ):
+        packed_broadcast_producer(
+            iterator=iter(params),
+            group=producer_group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+        )
+
+        consumer_group = MockConsumerCommunicationGroup(
+            producer_group.broadcasted_tensors
+        )
+        unpacked_tensors = {}
+
+        def post_unpack_func(tensor_list):
+            unpacked_tensors.update(tensor_list)
+
+        packed_broadcast_consumer(
+            iterator=iter(create_mock_state_dict_info(params).items()),
+            group=consumer_group,
+            src=0,
+            post_unpack_func=post_unpack_func,
+        )
+
+    assert [tensor.numel() for tensor in producer_group.broadcasted_tensors] == [
+        params[0][1].nbytes,
+        params[1][1].nbytes,
+    ]
+    for name, original_tensor in params:
+        assert torch.equal(unpacked_tensors[name], original_tensor)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_legacy_packing_keeps_oversized_tensor_in_prefix_buffer():
+    """vLLM's own consumer (Dynamo) packs an oversized tensor with its prefix."""
+    params = [
+        ("small_weight", torch.randn(16, dtype=torch.float32).cuda()),
+        ("large_weight", torch.randn(100, dtype=torch.float32).cuda()),
+    ]
+    group = MockCommunicationGroup()
+
+    with patch(
+        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size", return_value=100
+    ):
+        packed_broadcast_producer(
+            iterator=iter(params),
+            group=group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+            use_legacy_packing=True,
+        )
+
+    assert [t.numel() for t in group.broadcasted_tensors] == [
+        sum(t.nbytes for _, t in params)
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_multiple_batches():
+    """Test that tensors are properly batched when exceeding target size."""
+    # Create many small tensors
+    params = [
+        (f"weight_{i}", torch.randn(10, 10, dtype=torch.float32).cuda())
+        for i in range(20)
+    ]
+
+    # Create mock communication group
+    mock_group = MockCommunicationGroup()
+
+    # Small target size to force multiple batches
+    with patch(
+        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size", return_value=2000
+    ):
+        packed_broadcast_producer(
+            iterator=iter(params),
+            group=mock_group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+        )
+
+    # Should have multiple broadcasts
+    assert mock_group.broadcast_count > 1
+
+    # Total size should match sum of all tensors
+    total_broadcasted_size = sum(t.numel() for t in mock_group.broadcasted_tensors)
+    expected_total_size = sum(t.numel() * t.element_size() for _, t in params)
+    assert total_broadcasted_size == expected_total_size
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_packed_broadcast_producer_carries_export_dependency_across_streams(
+    monkeypatch,
+):
+    """Each buffer's stream must wait for the previous buffer's export before packing.
+
+    ``full_tensor()`` registers the completion of its all-gather only on the
+    stream that was current when it ran. When the iterator yields several views
+    of one gathered tensor (per-expert weights) and the packer switches streams
+    between them, the new stream has to inherit that dependency, and it must do
+    so through an event recorded *before* the previous broadcast so the two
+    buffers still overlap. The old code only synchronized the reused buffer's
+    own stream and fails this test.
+    """
+    # Streams are identified by their CUDA handle: torch.cuda.current_stream()
+    # returns a fresh Python wrapper on every call, so object identity would
+    # never match the Stream objects the packer holds.
+    events: list = []  # ("record", event_id, cuda_stream) / ("wait", cuda_stream, event_id) / ("broadcast", cuda_stream)
+
+    real_event_cls = torch.cuda.Event
+
+    class _Event(real_event_cls):
+        def record(self, stream=None):
+            stream = stream if stream is not None else torch.cuda.current_stream()
+            events.append(("record", id(self), stream.cuda_stream))
+            return super().record(stream)
+
+    real_wait_event = torch.cuda.Stream.wait_event
+
+    def wait_event(self, event):
+        events.append(("wait", self.cuda_stream, id(event)))
+        return real_wait_event(self, event)
+
+    monkeypatch.setattr(torch.cuda, "Event", _Event)
+    monkeypatch.setattr(torch.cuda.Stream, "wait_event", wait_event)
+
+    params = [(name, t.cuda()) for name, t in create_mock_model_params()]
+
+    class _Group:
+        def broadcast(self, tensor, src):
+            events.append(("broadcast", torch.cuda.current_stream().cuda_stream))
+
+    with patch(
+        "nemo_rl.utils.packed_tensor.get_target_packed_tensor_size",
+        return_value=2000,
+    ):
+        packed_broadcast_producer(
+            iterator=iter(params),
+            group=_Group(),
+            src=0,
+            post_iter_func=lambda x: x[1],
+            num_buffers=2,
+        )
+
+    broadcasts = [i for i, e in enumerate(events) if e[0] == "broadcast"]
+    assert len(broadcasts) >= 3, "need at least one buffer reuse to be meaningful"
+    for prev_b, next_b in zip(broadcasts[:-1], broadcasts[1:]):
+        prev_stream = events[prev_b][1]
+        next_stream = events[next_b][1]
+        assert prev_stream != next_stream, "buffers must alternate streams"
+        # An event recorded on the previous stream before its broadcast ...
+        recorded = {
+            e[1] for e in events[:prev_b] if e[0] == "record" and e[2] == prev_stream
+        }
+        # ... is waited on by the next stream before the next broadcast.
+        waited = {
+            e[2]
+            for e in events[prev_b:next_b]
+            if e[0] == "wait" and e[1] == next_stream
+        }
+        assert recorded & waited, (
+            "next buffer's stream did not wait on an export event recorded on the "
+            "previous stream before the previous broadcast"
+        )

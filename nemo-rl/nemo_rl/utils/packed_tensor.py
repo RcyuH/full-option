@@ -1,0 +1,367 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+import os
+from collections.abc import Callable, Iterator
+from functools import lru_cache
+from typing import Any, List, Tuple
+
+import torch
+
+
+@lru_cache(maxsize=1)
+def get_target_packed_tensor_size():
+    memory_ratio = os.getenv("NRL_REFIT_BUFFER_MEMORY_RATIO", "0.02")
+    device = torch.device("cuda")
+    props = torch.cuda.get_device_properties(device)
+    total_memory_bytes = props.total_memory
+    # max size is 5GB
+    target_size = min(int(total_memory_bytes * float(memory_ratio)), 5 * 1024**3)
+    return target_size
+
+
+@lru_cache(maxsize=1)
+def get_num_buffers():
+    return int(os.getenv("NRL_REFIT_NUM_BUFFERS", "2"))
+
+
+def packed_broadcast_producer(
+    iterator,
+    group,
+    src,
+    post_iter_func,
+    *,
+    buffer_size_bytes: int | None = None,
+    num_buffers: int | None = None,
+    use_legacy_packing: bool = False,
+):
+    """Broadcast a list of tensors in a packed manner.
+
+    Args:
+        iterator: iterator of model parameters. Returns a tuple of (name, tensor)
+        group: process group (vllm PyNcclCommunicator)
+        src: source rank (0 in current implementation)
+        post_iter_func: function to apply to each tensor before packing, should return a tensor
+        buffer_size_bytes: packed-buffer target. Uses the NeMo-RL default when unset.
+        num_buffers: number of alternating CUDA buffers. Uses the default when unset.
+        use_legacy_packing: pack an oversized tensor with the ones before it, as
+            vLLM's own consumer expects, instead of sending it in its own broadcast.
+
+    Returns:
+        None
+
+    """
+    if buffer_size_bytes is not None and buffer_size_bytes <= 0:
+        raise ValueError("buffer_size_bytes must be > 0")
+    target_packed_tensor_size = (
+        get_target_packed_tensor_size()
+        if buffer_size_bytes is None
+        else buffer_size_bytes
+    )
+
+    num_buffers = get_num_buffers() if num_buffers is None else num_buffers
+    streams = [torch.cuda.Stream() for _ in range(num_buffers)]
+    buffer_idx = 0
+    pending_tensor = None
+
+    packing_tensor_list = [[] for _ in range(num_buffers)]
+    packing_tensor_sizes = [0 for _ in range(num_buffers)]
+    packed_tensors = [
+        torch.empty(0, dtype=torch.uint8, device="cuda") for _ in range(num_buffers)
+    ]
+
+    # The iterator is driven from alternating streams, but the work it enqueues
+    # for one item (e.g. an FSDP2 all-gather whose completion ``full_tensor()``
+    # registers only on the stream that was current at the time) may be read by
+    # the *next* item on the other stream: the state-dict adapter yields several
+    # per-expert views of one gathered tensor, and a multi-GB expert parameter
+    # always straddles a buffer boundary. Carry the previous stream's export
+    # dependencies over to the new stream with an event recorded *before* the
+    # previous broadcast is issued, so packing of buffer k+1 still overlaps the
+    # broadcast of buffer k and no host synchronization is added.
+    export_done: torch.cuda.Event | None = None
+    while True:
+        # Move to the next buffer
+        buffer_idx = (buffer_idx + 1) % num_buffers
+        # Synchronize the current stream
+        streams[buffer_idx].synchronize()
+        if export_done is not None:
+            streams[buffer_idx].wait_event(export_done)
+        # Start tasks for the new buffer in a new stream
+        with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
+            try:
+                # Initialize the packing tensor list and sizes
+                packing_tensor_list[buffer_idx] = []
+                packing_tensor_sizes[buffer_idx] = 0
+                # Pack the tensors
+                while True:
+                    if pending_tensor is None:
+                        # Apply backend specific post processing and then convert to linearized uint8 tensor.
+                        # contiguous() is required because the upstream iterator may
+                        # yield non-contiguous tensors that view(...) cannot handle.
+                        tensor = post_iter_func(next(iterator))
+                        if tensor.device.type != "cuda":
+                            # Everything here is concatenated into one buffer and
+                            # broadcast over a CUDA collective, so a single host
+                            # tensor anywhere in the stream fails the cat. The
+                            # producer owns its buffer's device rather than
+                            # trusting every upstream exporter to agree.
+                            tensor = tensor.to(torch.cuda.current_device())
+                        tensor = tensor.contiguous().reshape(-1).view(torch.uint8)
+                    else:
+                        tensor = pending_tensor
+                        pending_tensor = None
+                    if (
+                        not use_legacy_packing
+                        and packing_tensor_list[buffer_idx]
+                        and tensor.numel() > target_packed_tensor_size
+                    ):
+                        pending_tensor = tensor
+                        break
+                    packing_tensor_list[buffer_idx].append(tensor)
+                    packing_tensor_sizes[buffer_idx] += tensor.numel()
+                    if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
+                        break
+                # Pack the tensors and call broadcast collective
+                packed_tensors[buffer_idx] = (
+                    packing_tensor_list[buffer_idx][0]
+                    if len(packing_tensor_list[buffer_idx]) == 1
+                    else torch.cat(packing_tensor_list[buffer_idx], dim=0)
+                )
+                export_done = torch.cuda.Event()
+                export_done.record(streams[buffer_idx])
+                group.broadcast(packed_tensors[buffer_idx], src=src)
+                if (
+                    len(packing_tensor_list[buffer_idx]) == 1
+                    and packing_tensor_sizes[buffer_idx] > target_packed_tensor_size
+                ):
+                    # Oversized tensor: drain its collective and free it before
+                    # materializing the next one.
+                    for idx, stream in enumerate(streams):
+                        stream.synchronize()
+                        packing_tensor_list[idx].clear()
+                        packed_tensors[idx] = torch.empty(
+                            0, dtype=torch.uint8, device="cuda"
+                        )
+                    del tensor
+            except StopIteration:
+                # do the last broadcast if there are remaining tensors
+                if len(packing_tensor_list[buffer_idx]) > 0:
+                    packed_tensors[buffer_idx] = (
+                        packing_tensor_list[buffer_idx][0]
+                        if len(packing_tensor_list[buffer_idx]) == 1
+                        else torch.cat(packing_tensor_list[buffer_idx], dim=0)
+                    )
+                    group.broadcast(packed_tensors[buffer_idx], src=src)
+                break
+
+    # Join all packing/broadcast side streams before returning. Without this,
+    # the caller may mutate or offload the source weights while the final
+    # broadcasts are still in flight on the side streams (vLLM >= 0.25's
+    # PyNcclCommunicator enqueues on the current stream without blocking).
+    for s in streams:
+        s.synchronize()
+
+
+def _packed_broadcast_consumer_batches(
+    iterator: Iterator[Any],
+    group: Any,
+    src: int,
+    *,
+    num_buffers: int | None = None,
+) -> Iterator[list[tuple[str, torch.Tensor]]]:
+    """Yield unpacked batches while retaining ownership of their receive buffers."""
+
+    def unpack_tensor(
+        packed_tensor: torch.Tensor, meta_data_list: list[Any]
+    ) -> List[Tuple[str, torch.Tensor]]:
+        """Unpack a single tensor into a list of tensors.
+
+        Args:
+            packed_tensor: the packed torch.uint8 tensor to unpack
+            meta_data_list: List[(name, shape, dtype, offset, tensor_size)]
+
+        Returns:
+            unpacked List[(name, tensor)]
+        """
+        packed_tensor_sizes = list(map(lambda x: x[4], meta_data_list))
+        unpacked_tensor = packed_tensor.split_with_sizes(packed_tensor_sizes)
+
+        def restore_tensor(
+            tensor: torch.Tensor, shape: torch.Size | list[int], dtype: torch.dtype
+        ) -> torch.Tensor:
+            """Restore dtype and shape for a tensor from the packed byte stream.
+
+            Unlike the 512-byte-aligned IPC/ZMQ refit path, packed collective
+            refit adds no padding between tensors. Scalar GEMM or K/V amax can
+            therefore leave the next mixed-dtype slice unaligned. Cloning moves
+            only such slices to offset zero. ``reshape(tuple(shape))`` accepts an
+            empty tuple and therefore also restores scalar tensors.
+            """
+            if tensor.storage_offset() % dtype.itemsize:
+                tensor = tensor.clone()
+            return tensor.view(dtype).reshape(tuple(shape))
+
+        return [
+            (
+                meta_data_list[i][0],
+                restore_tensor(tensor, meta_data_list[i][1], meta_data_list[i][2]),
+            )
+            for i, tensor in enumerate(unpacked_tensor)
+        ]
+
+    target_packed_tensor_size = get_target_packed_tensor_size()
+
+    if num_buffers is None:
+        num_buffers = get_num_buffers()
+    streams = [torch.cuda.Stream() for _ in range(num_buffers)]
+    buffer_idx = 0
+    pending_meta_data = None
+
+    packing_tensor_meta_data = [[] for _ in range(num_buffers)]
+    packing_tensor_sizes = [0 for _ in range(num_buffers)]
+    offsets = [0 for _ in range(num_buffers)]
+    packed_tensors = [
+        torch.empty(0, dtype=torch.uint8, device="cuda") for _ in range(num_buffers)
+    ]
+
+    try:
+        while True:
+            # Move to the next buffer
+            buffer_idx = (buffer_idx + 1) % num_buffers
+            # Synchronize the current stream before its buffer is reused.
+            streams[buffer_idx].synchronize()
+            with torch.cuda.stream(streams[buffer_idx]):  # type: ignore[arg-type]
+                # Initialize the packing tensor meta data
+                packing_tensor_meta_data[buffer_idx] = []
+                packing_tensor_sizes[buffer_idx] = 0
+                offsets[buffer_idx] = 0
+                try:
+                    # Form a packed tensor
+                    while True:
+                        if pending_meta_data is None:
+                            name, (shape, dtype) = next(iterator)
+                            tensor_size = math.prod(shape) * dtype.itemsize
+                        else:
+                            name, shape, dtype, tensor_size = pending_meta_data
+                            pending_meta_data = None
+                        if (
+                            packing_tensor_meta_data[buffer_idx]
+                            and tensor_size > target_packed_tensor_size
+                        ):
+                            pending_meta_data = (name, shape, dtype, tensor_size)
+                            break
+                        packing_tensor_meta_data[buffer_idx].append(
+                            (name, shape, dtype, offsets[buffer_idx], tensor_size)
+                        )
+                        packing_tensor_sizes[buffer_idx] += tensor_size
+                        offsets[buffer_idx] += tensor_size
+                        if packing_tensor_sizes[buffer_idx] > target_packed_tensor_size:
+                            break
+                    # Create a packed tensor and broadcast it
+                    packed_tensors[buffer_idx] = torch.empty(
+                        packing_tensor_sizes[buffer_idx],
+                        dtype=torch.uint8,
+                        device="cuda",
+                    )
+                    group.broadcast(packed_tensors[buffer_idx], src=src)
+                    yield unpack_tensor(
+                        packed_tensors[buffer_idx],
+                        packing_tensor_meta_data[buffer_idx],
+                    )
+                    if (
+                        len(packing_tensor_meta_data[buffer_idx]) == 1
+                        and packing_tensor_sizes[buffer_idx] > target_packed_tensor_size
+                    ):
+                        for idx, stream in enumerate(streams):
+                            stream.synchronize()
+                            packing_tensor_meta_data[idx].clear()
+                            packed_tensors[idx] = torch.empty(
+                                0, dtype=torch.uint8, device="cuda"
+                            )
+                except StopIteration:
+                    # Do the last broadcast if there are remaining tensors.
+                    if len(packing_tensor_meta_data[buffer_idx]) > 0:
+                        packed_tensors[buffer_idx] = torch.empty(
+                            packing_tensor_sizes[buffer_idx],
+                            dtype=torch.uint8,
+                            device="cuda",
+                        )
+                        group.broadcast(packed_tensors[buffer_idx], src=src)
+                        yield unpack_tensor(
+                            packed_tensors[buffer_idx],
+                            packing_tensor_meta_data[buffer_idx],
+                        )
+                    break
+    finally:
+        # Join all recv/unpack/load side streams before returning. Without this,
+        # generation can start reading model weights while the final unpack/load
+        # copies are still in flight on the side streams, producing garbage
+        # logprobs (vLLM >= 0.25's PyNcclCommunicator enqueues on the current
+        # stream without blocking).
+        for stream in streams:
+            stream.synchronize()
+
+
+def packed_broadcast_consumer(
+    iterator: Iterator[Any],
+    group: Any,
+    src: int,
+    post_unpack_func: Callable[[list[tuple[str, torch.Tensor]]], None] | None,
+    return_iterator: bool = False,
+    *,
+    num_buffers: int | None = None,
+) -> Iterator[tuple[str, torch.Tensor]] | None:
+    """Consume a packed tensor as callbacks or a lazy weight iterator.
+
+    Args:
+        iterator: iterator of model parameters. Returns a tuple of (name, tensor)
+        group: process group (vllm PyNcclCommunicator)
+        src: source rank (0 in current implementation)
+        post_unpack_func: function to apply to each unpacked batch. May be None
+            when ``return_iterator`` is True.
+        return_iterator: return a lazy, flattened weight iterator for consumers
+            such as vLLM's ``reload_weights`` API.
+        num_buffers: number of alternating CUDA buffers/streams. Uses the
+            NRL_REFIT_NUM_BUFFERS default when unset. Chunk boundaries only
+            depend on the packed-buffer target size, so the producer and
+            consumer may use different buffer counts.
+
+    Returns:
+        A lazy iterator when ``return_iterator`` is True, otherwise None.
+
+    """
+    batches = _packed_broadcast_consumer_batches(
+        iterator, group, src, num_buffers=num_buffers
+    )
+    if return_iterator:
+
+        def weight_iterator() -> Iterator[tuple[str, torch.Tensor]]:
+            try:
+                for batch in batches:
+                    for weight in batch:
+                        yield weight
+            finally:
+                close_batches = getattr(batches, "close", None)
+                if close_batches is not None:
+                    close_batches()
+
+        return weight_iterator()
+
+    if post_unpack_func is None:
+        raise ValueError("post_unpack_func is required when return_iterator is False")
+    for batch in batches:
+        post_unpack_func(batch)
+    return None

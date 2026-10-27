@@ -1,0 +1,229 @@
+# OPSD (On-Policy Self-Distillation) Trainer config
+#
+# Based on sd_trainer.yaml. Key differences:
+#   - `opsd` section replaces `self_distill` section
+#   - ref model (dp_ref) is actually used as the frozen teacher
+#   - No baseline_sft_mode or min_correct_for_training (OPSD trains on ALL rollouts)
+#
+# Usage:
+#   python -m self_distill_hybrid.main_opsd \
+#     --config-path ./config --config-name opsd_trainer \
+#     actor_rollout_ref.model.path=/path/to/model \
+#     data.train_files=/path/to/sd_prompts.parquet
+
+# Add VERL's config directory to Hydra's search path so defaults resolve correctly
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+# Inherit shared sub-configs from VERL
+defaults:
+  # Actor config (optimizer, FSDP, gradient checkpointing, etc.)
+  - actor@actor_rollout_ref.actor: dp_actor
+
+  # Data config (batch sizes, lengths, shuffle, etc.)
+  - data@data: legacy_data
+
+  # Reference model config — actually used for OPSD as the frozen teacher
+  - ref@actor_rollout_ref.ref: dp_ref
+
+  # Rollout config (sglang, TP/DP, prompt/response lengths, etc.)
+  - rollout@actor_rollout_ref.rollout: rollout
+
+  # Model config (path, gradient checkpointing, etc.)
+  - model@actor_rollout_ref.model: hf_model
+
+  # Legacy reward impl (for backward compat with old reward_model schema)
+  - legacy_reward_impl
+
+  # Reward config (new verl 0.7.x layout; load_reward_manager reads config.reward.*)
+  - reward@reward: reward
+
+  # Rollout correction config (for schema compatibility)
+  - algorithm@algorithm.rollout_correction: rollout_correction
+
+  - _self_
+
+# ---------- Data overrides ----------
+data:
+  # Pin Qwen3 thinking mode explicitly. The Qwen3 tokenizer's default is
+  # enable_thinking=True, but pinning here guards against upstream default
+  # drift in future tokenizer releases.
+  apply_chat_template_kwargs:
+    enable_thinking: true
+
+# ---------- Actor + Rollout + Ref ----------
+actor_rollout_ref:
+  hybrid_engine: true
+  nccl_timeout: 600
+
+  rollout:
+    # Use sglang for generation
+    name: sglang
+    layered_summon: false
+    # Generation parameters
+    temperature: 0.7
+    top_p: 0.95
+    # Single response per prompt
+    n: 1
+
+    # Sampling parameters for generation-based validation (_validate).
+    # Qwen3 model-card recommended config for thinking mode. Greedy decoding
+    # in thinking mode causes documented repetition pathology (Qwen3 docs).
+    # n=8 matches the standalone eval protocol (workspace/src/eval/run_eval.py)
+    # so in-training val numbers are directly comparable to Table 2 / Table 6.
+    val_kwargs:
+      n: 8
+      do_sample: true
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 20
+      # NOTE: do NOT add min_p — verl's SamplingConfig dataclass on the
+      # cluster image rejects it (TypeError on Hydra instantiate). Qwen3's
+      # recommended min_p=0 is implicitly the default anyway.
+
+  # Ref model config — OPSD actually uses ref_module_fsdp as frozen teacher
+  ref:
+    fsdp_config:
+      param_offload: true
+
+# ---------- Algorithm (unused but required for schema) ----------
+algorithm:
+  _target_: verl.trainer.config.AlgoConfig
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: true
+  use_kl_in_reward: false
+  kl_penalty: kl
+  kl_ctrl:
+    _target_: verl.trainer.config.KLControlConfig
+    type: fixed
+    kl_coef: 0.001
+    horizon: 10000
+    target_kl: 0.1
+  use_pf_ppo: false
+  pf_ppo:
+    reweight_method: pow
+    weight_pow: 2.0
+
+# ---------- OPSD specific ----------
+opsd:
+  # JSD interpolation parameter: beta=0.5 gives symmetric JSD
+  # beta * KL(p_teacher || m) + (1-beta) * KL(p_student || m)
+  beta: 0.5
+
+  # Loss type: "jsd" (Jensen-Shannon divergence) or "reverse_kl" (KL(student || teacher))
+  # reverse_kl is mode-seeking — student concentrates on teacher's high-probability tokens
+  loss_type: reverse_kl
+
+  # Maximum sequence length for OPSD training (prompt + response)
+  sft_max_length: 32768
+
+  # Max response tokens for validation generation (null = use rollout default).
+  # 30,000 matches the paper's reported "no-truncation" budget (Table 2, README launch examples).
+  val_max_tokens: 30000
+
+  # Max new tokens for training generation (caps SGLang output).
+  # null = use rollout response_length (no cap beyond buffer size).
+  sd_max_tokens: null
+
+  # Whether to check <think>...</think> + Answer: structure (for metrics only)
+  check_structure: true
+
+  # Number of sample responses to log per step
+  log_sample_count: 5
+
+  # Generation-based validation frequency (uses data.val_files + reward fn).
+  # Set to 0 or -1 to disable.
+  test_freq: 10
+
+  # Write detailed JSON log files every N steps
+  log_freq: 5
+
+  # Hard-copy student weights to teacher every N training steps.
+  # 0 or null = never update (teacher stays frozen at init weights).
+  teacher_update_freq: 0
+
+  # Directory for detailed JSON logs.
+  # If null, falls back to <checkpoint_dir>/detailed_logs.
+  detailed_log_dir: null
+
+# ---------- Reward model (disabled for OPSD) ----------
+reward_model:
+  enable: false
+  enable_resource_pool: false
+  use_reward_loop: false
+  use_dynamic_bsz: false
+  forward_max_token_len_per_gpu: 16384
+
+# Custom reward function lives under `reward.custom_reward_function`
+# (provided by the inherited `reward@reward: reward` default). Override at the
+# CLI as: reward.custom_reward_function.path=/path/to/scorer.py
+
+# ---------- Trainer config ----------
+trainer:
+  balance_batch: false
+  total_epochs: 10
+  total_training_steps: null
+  project_name: opsd
+  experiment_name: opsd_hybrid
+  logger: ["console", "wandb"]
+  log_val_generations: 0
+  nnodes: 1
+  n_gpus_per_node: 8
+  save_freq: -1
+  esi_redundant_time: 0
+  resume_mode: disable
+  resume_from_path: null
+  val_before_train: false
+  val_only: false
+  test_freq: -1
+  critic_warmup: 0
+  default_hdfs_dir: null
+  del_local_ckpt_after_load: false
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  max_actor_ckpt_to_keep: null
+  max_critic_ckpt_to_keep: null
+  ray_wait_register_center_timeout: 300
+  device: cuda
+  use_legacy_worker_impl: auto
+
+# ---------- Profiler (minimal) ----------
+global_profiler:
+  _target_: verl.utils.profiler.ProfilerConfig
+  tool: null
+  steps: null
+  profile_continuous_steps: false
+  save_path: "outputs/profile"
+  global_tool_config:
+    nsys:
+      _target_: verl.utils.profiler.config.NsightToolConfig
+      discrete: false
+      controller_nsight_options:
+        trace: "cuda,nvtx,cublas,ucx"
+        cuda-memory-usage: "true"
+        cuda-graph-trace: "graph"
+      worker_nsight_options:
+        trace: "cuda,nvtx,cublas,ucx"
+        cuda-memory-usage: "true"
+        cuda-graph-trace: "graph"
+        capture-range: "cudaProfilerApi"
+        capture-range-end: null
+        kill: none
+    torch_memory:
+      trace_alloc_max_entries: 100000
+      stack_depth: 32
+      context: "all"
+      stacks: "all"
+      kw_args: {}
+
+# ---------- TransferQueue (disabled) ----------
+transfer_queue:
+  enable: false
+
+# ---------- Ray config ----------
+ray_kwargs:
+  ray_init:
+    num_cpus: null
+  timeline_json_file: null
