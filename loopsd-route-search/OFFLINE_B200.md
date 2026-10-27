@@ -39,8 +39,8 @@ Giữ layout khi chuyển dữ liệu; `/srv/loopsd` dưới đây chỉ là đ�
 
 ```text
 /srv/loopsd/project/
-├── code/
-│   ├── nemo-rl/                  # Bao gồm .git để ghi provenance
+├── code/full-option/             # Clone repo RcyuH/full-option
+│   ├── nemo-rl/                  # NeMo RL source snapshot
 │   └── loopsd-route-search/
 │       ├── offline-bundle/       # Sinh bởi script dưới đây
 │       ├── configs/
@@ -56,7 +56,7 @@ Giữ layout khi chuyển dữ liệu; `/srv/loopsd` dưới đây chỉ là đ�
 Trên máy Linux có mạng, từ thư mục code đã sao chép:
 
 ```bash
-cd /srv/loopsd/project/code/loopsd-route-search
+cd /srv/loopsd/project/code/full-option/loopsd-route-search
 PYTHON=python3.13 bash scripts/prepare_offline.sh
 ```
 
@@ -75,8 +75,8 @@ BUNDLE="$PWD/offline-bundle-v2" PREP_VENV="$PWD/.venv-prepare-v2" \
   PYTHON=python3.13 bash scripts/prepare_offline.sh
 ```
 
-Chuyển **offline-bundle**, source `loopsd-route-search`, checkout `nemo-rl` gồm
-`.git`, model và parquet sang server bằng cách truyền file bạn đang dùng.
+Chuyển **offline-bundle**, repo `full-option`, model và parquet sang server bằng
+cách truyền file bạn đang dùng.
 Không cần chuyển CRISP, `.venv` của Mac hoặc outputs chạy trên Mac. Nếu model
 có symlink tới Hugging Face cache, chuyển cả nội dung đích; Git LFS pointer
 không thay thế được file trọng số. Python interpreter, driver và thư viện OS
@@ -85,7 +85,7 @@ không nằm trong wheelhouse: chuẩn bị chúng trong OS/container trước.
 ## 3. Cài trên server không có mạng
 
 ```bash
-cd /srv/loopsd/project/code/loopsd-route-search
+cd /srv/loopsd/project/code/full-option/loopsd-route-search
 python3.13 -m venv .venv-b200
 source .venv-b200/bin/activate
 
@@ -104,36 +104,38 @@ python -c 'import torch; print(torch.__version__, torch.version.cuda); assert to
 ```
 
 Không cần `pip install -e .` hoặc cài package `nemo-rl`: wrapper trong mục 4
-thêm source của hai project vào đường dẫn import. Bộ requirements chỉ đủ cho
-route search và API imports của checkout NeMo này. Không dùng nó để thay thế
-dependency của toàn bộ NeMo training stack.
+thêm source của hai project vào đường dẫn import. Repo `full-option` có một Git
+root chung; manifest lấy commit ở root và fingerprint diff trong
+`nemo-rl/nemo_rl`. Bộ requirements chỉ đủ cho route search và API imports của
+checkout NeMo này. Không dùng nó để thay thế dependency của toàn bộ NeMo
+training stack.
 
 ## 4. Lệnh chạy
 
-Cấu hình server là `configs/qwen3_1p7b_gsm8k_b200.yaml`: ép CUDA, giữ budget
-400+128 và protocol search ban đầu, output riêng `outputs/qwen3_1p7b_gsm8k_b200`.
-Đường dẫn model/data/NeMo được tính từ **file YAML**, nên layout trên có thể
-được đặt ở bất kỳ mount point nào. Nếu đổi layout, sửa các path trong YAML
-trước lệnh đầu tiên.
+Cấu hình server là `configs/qwen3_1p7b_gsm8k_full_b200.yaml`: ép CUDA, giữ
+budget 400+128 và protocol search ban đầu, output riêng
+`outputs/qwen3_1p7b_gsm8k_full_b200`. Đường dẫn model/data/NeMo được tính từ
+**file YAML**, nên có thể đặt cả layout ở mount point khác. Config này trỏ
+model/dữ liệu ra `project/models` và `project/data`, còn NeMo RL ở trong repo.
 
 Từ thư mục `loopsd-route-search`, sau khi activate venv và source offline_env:
 
 ```bash
 # Xem split và số lượt sinh, chưa load trọng số.
-python examples/nemo_search.py plan --config configs/qwen3_1p7b_gsm8k_b200.yaml
+python examples/nemo_search.py plan --config configs/qwen3_1p7b_gsm8k_full_b200.yaml
 
 # Kiểm tra route/cache trên checkpoint thật ở GPU đích trước full search.
-python examples/nemo_search.py verify --config configs/qwen3_1p7b_gsm8k_b200.yaml --verify-route 8:12
+python examples/nemo_search.py verify --config configs/qwen3_1p7b_gsm8k_full_b200.yaml --verify-route 8:12
 
 # Baseline 128 câu của stage 1, được tái sử dụng khi search.
-python examples/nemo_search.py baseline --config configs/qwen3_1p7b_gsm8k_b200.yaml
+python examples/nemo_search.py baseline --config configs/qwen3_1p7b_gsm8k_full_b200.yaml
 
 # Chạy cả stage 1, stage 2 và validation để khóa route.
-python examples/nemo_search.py search --config configs/qwen3_1p7b_gsm8k_b200.yaml
+python examples/nemo_search.py search --config configs/qwen3_1p7b_gsm8k_full_b200.yaml
 
 # So route đã chọn với standard trên toàn bộ GSM8K test.
-python examples/nemo_search.py evaluate --config configs/qwen3_1p7b_gsm8k_b200.yaml
-python examples/nemo_search.py report --config configs/qwen3_1p7b_gsm8k_b200.yaml
+python examples/nemo_search.py evaluate --config configs/qwen3_1p7b_gsm8k_full_b200.yaml
+python examples/nemo_search.py report --config configs/qwen3_1p7b_gsm8k_full_b200.yaml
 ```
 
 Để dừng ở stage 1, thêm `--stop-after stage1` vào lệnh search. Chạy lại lệnh
@@ -144,11 +146,11 @@ config, môi trường, đường dẫn và output của run đó.
 Có thể đứng ngay trong `nemo-rl` sau khi activate cùng venv:
 
 ```bash
-cd /srv/loopsd/project/code/nemo-rl
+cd /srv/loopsd/project/code/full-option/nemo-rl
 source ../loopsd-route-search/scripts/offline_env.sh
 export CUDA_VISIBLE_DEVICES=0
 python ../loopsd-route-search/examples/nemo_search.py search \
-  --config ../loopsd-route-search/configs/qwen3_1p7b_gsm8k_b200.yaml
+  --config ../loopsd-route-search/configs/qwen3_1p7b_gsm8k_full_b200.yaml
 ```
 
 Batch size 1 là điểm bắt đầu bảo thủ, chưa được tối ưu cho B200. Có thể tăng

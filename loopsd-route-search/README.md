@@ -24,7 +24,7 @@ Sau khi chuẩn bị môi trường theo hướng dẫn đó:
 source .venv-b200/bin/activate
 source scripts/offline_env.sh
 export CUDA_VISIBLE_DEVICES=0
-python examples/nemo_search.py plan --config configs/qwen3_1p7b_gsm8k_b200.yaml
+python examples/nemo_search.py plan --config configs/qwen3_1p7b_gsm8k_full_b200.yaml
 ```
 
 Checkpoint và dữ liệu đọc trực tiếp từ các đường dẫn trong YAML, không tải lại.
@@ -43,32 +43,32 @@ bộ nhớ GPU, nhưng dùng thư mục output mới khi đổi cấu hình.
 Kiểm tra chia dữ liệu và khối lượng tính toán, chưa load trọng số:
 
 ```bash
-python examples/nemo_search.py plan --config configs/qwen3_1p7b_gsm8k_b200.yaml
+python examples/nemo_search.py plan --config configs/qwen3_1p7b_gsm8k_full_b200.yaml
 ```
 
 Kiểm tra cache, chia sẻ tham số và khôi phục route chuẩn trên checkpoint thật:
 
 ```bash
-python examples/nemo_search.py verify --config configs/qwen3_1p7b_gsm8k_b200.yaml --verify-route 8:12
+python examples/nemo_search.py verify --config configs/qwen3_1p7b_gsm8k_full_b200.yaml --verify-route 8:12
 ```
 
 Chạy baseline trên đúng 128 câu của stage 1, kết quả được dùng lại khi search:
 
 ```bash
-python examples/nemo_search.py baseline --config configs/qwen3_1p7b_gsm8k_b200.yaml
+python examples/nemo_search.py baseline --config configs/qwen3_1p7b_gsm8k_full_b200.yaml
 ```
 
 Tìm kiếm đầy đủ; có thể dừng sau stage 1 để xem kết quả:
 
 ```bash
-python examples/nemo_search.py search --config configs/qwen3_1p7b_gsm8k_b200.yaml --stop-after stage1
-python examples/nemo_search.py search --config configs/qwen3_1p7b_gsm8k_b200.yaml
+python examples/nemo_search.py search --config configs/qwen3_1p7b_gsm8k_full_b200.yaml --stop-after stage1
+python examples/nemo_search.py search --config configs/qwen3_1p7b_gsm8k_full_b200.yaml
 ```
 
 Sau khi route được khóa bằng validation, chạy đánh giá test:
 
 ```bash
-python examples/nemo_search.py evaluate --config configs/qwen3_1p7b_gsm8k_b200.yaml
+python examples/nemo_search.py evaluate --config configs/qwen3_1p7b_gsm8k_full_b200.yaml
 ```
 
 Chạy lại cùng lệnh để tiếp tục; các câu đã lưu sẽ được bỏ qua. File lock ngăn
@@ -88,9 +88,9 @@ Trong môi trường NeMo RL đã được cài đầy đủ, đứng ở checko
 
 ```bash
 python ../loopsd-route-search/examples/nemo_search.py plan \
-  --config ../loopsd-route-search/configs/qwen3_1p7b_gsm8k_b200.yaml
+  --config ../loopsd-route-search/configs/qwen3_1p7b_gsm8k_full_b200.yaml
 python ../loopsd-route-search/examples/nemo_search.py search \
-  --config ../loopsd-route-search/configs/qwen3_1p7b_gsm8k_b200.yaml
+  --config ../loopsd-route-search/configs/qwen3_1p7b_gsm8k_full_b200.yaml
 ```
 
 Wrapper thêm source package này vào `sys.path` và chọn `backend: nemo`.

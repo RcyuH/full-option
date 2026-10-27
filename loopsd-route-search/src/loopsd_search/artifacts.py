@@ -46,11 +46,19 @@ def model_fingerprint(path: Path) -> dict[str, str]:
 def make_manifest(cfg: ExperimentConfig, split_ids: dict[str, list[str]]) -> dict:
     root = Path(__file__).resolve().parent
     source = {item.name: digest_file(item) for item in sorted(root.glob("*.py"))}
+    git_root = Path(
+        subprocess.check_output(
+            ["git", "-C", str(cfg.nemo_rl_path), "rev-parse", "--show-toplevel"], text=True
+        ).strip()
+    )
     nemo_commit = subprocess.check_output(
-        ["git", "-C", str(cfg.nemo_rl_path), "rev-parse", "HEAD"], text=True
+        ["git", "-C", str(git_root), "rev-parse", "HEAD"], text=True
     ).strip()
+    nemo_package = (cfg.nemo_rl_path / "nemo_rl").resolve()
+    nemo_package_relative = nemo_package.relative_to(git_root)
     nemo_diff = subprocess.check_output(
-        ["git", "-C", str(cfg.nemo_rl_path), "diff", "HEAD", "--", "nemo_rl"], text=True
+        ["git", "-C", str(git_root), "diff", "HEAD", "--", str(nemo_package_relative)],
+        text=True,
     )
     value = {
         "schema_version": 1,
