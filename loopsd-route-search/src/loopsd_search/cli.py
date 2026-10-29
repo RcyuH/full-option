@@ -25,7 +25,7 @@ def main() -> None:
         "--resume-batch-size",
         type=int,
         help=(
-            "Resume an existing search with this smaller generation batch size; "
+            "Resume search/evaluation with this generation batch size; "
             "validates provenance and preserves the existing run fingerprint"
         ),
     )
@@ -41,8 +41,8 @@ def main() -> None:
     args = parser.parse_args()
     cfg = load_config(args.config)
     if args.resume_batch_size is not None:
-        if args.command != "search":
-            parser.error("--resume-batch-size is only valid with the search command")
+        if args.command not in {"search", "evaluate"}:
+            parser.error("--resume-batch-size is only valid with search or evaluate")
         if args.resume_batch_size < 1:
             parser.error("--resume-batch-size must be at least 1")
         cfg.model.batch_size = args.resume_batch_size
@@ -121,6 +121,7 @@ def main() -> None:
         store = RunStore(
             cfg.output_dir,
             manifest,
+            allow_compatible_resume=(args.command == "evaluate" or args.resume_batch_size is not None),
             allow_batch_size_change=args.resume_batch_size is not None,
         )
         if args.command == "evaluate" and not (cfg.output_dir / "selected_route.json").exists():

@@ -109,7 +109,12 @@ class RunStore:
     }
 
     def __init__(
-        self, root: Path, manifest: dict, *, allow_batch_size_change: bool = False
+        self,
+        root: Path,
+        manifest: dict,
+        *,
+        allow_compatible_resume: bool = False,
+        allow_batch_size_change: bool = False,
     ) -> None:
         self.root = root
         self.fingerprint = manifest["fingerprint"]
@@ -117,7 +122,9 @@ class RunStore:
         if path.exists():
             old = json.loads(path.read_text())
             if old != manifest:
-                if not allow_batch_size_change or not self._compatible_batch_resume(old, manifest):
+                if not allow_compatible_resume or not self._compatible_resume(
+                    old, manifest, allow_batch_size_change=allow_batch_size_change
+                ):
                     raise ValueError(
                         "Run provenance changed. Choose a fresh output_dir; refusing mixed results."
                     )
@@ -137,8 +144,10 @@ class RunStore:
             atomic_json(path, manifest)
 
     @classmethod
-    def _compatible_batch_resume(cls, old: dict, new: dict) -> bool:
-        """Permit only a batch-size change plus known loop-factor release metadata."""
+    def _compatible_resume(
+        cls, old: dict, new: dict, *, allow_batch_size_change: bool
+    ) -> bool:
+        """Permit known source metadata changes and, optionally, batch-size changes."""
         if old.get("schema_version") != new.get("schema_version"):
             return False
         for candidate in (old, new):
@@ -152,7 +161,7 @@ class RunStore:
         try:
             old_batch = old_config["model"]["batch_size"]
             new_batch = new_config["model"]["batch_size"]
-            if old_batch == new_batch:
+            if old_batch != new_batch and not allow_batch_size_change:
                 return False
             old_config["model"]["batch_size"] = new_config["model"]["batch_size"]
             # loop_factors was added later; absent in old manifests means [2].

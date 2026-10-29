@@ -115,6 +115,12 @@ thận trọng như `8` hoặc `16`. Chương trình chỉ sinh các ví dụ c�
 cho các ví dụ sinh mới, nên đây là cách phục hồi run thực tế chứ không đảm bảo
 khớp bit-for-bit. Không xóa hoặc thay `manifest.json`.
 
+Nếu muốn chạy lại đánh giá từ đầu thay vì tiếp tục tape test, chỉ xóa
+`predictions/test/` và `test_comparison.json` trong `output_dir`, rồi chạy
+`evaluate` lại. Giữ nguyên manifest, `selected_route.json` và các tape/search
+summary. Nếu evaluate cũng cần batch nhỏ hơn, thêm `--resume-batch-size 16`;
+cờ này vẫn giữ fingerprint gốc.
+
 ## Dùng NeMo RL
 
 Adapter ở `src/loopsd_search/nemo_adapter.py` có `generate`, lifecycle và dữ liệu
