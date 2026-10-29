@@ -22,6 +22,14 @@ def main() -> None:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--backend", choices=["hf", "nemo"], help="Override execution backend")
     parser.add_argument(
+        "--resume-batch-size",
+        type=int,
+        help=(
+            "Resume an existing search with this smaller generation batch size; "
+            "validates provenance and preserves the existing run fingerprint"
+        ),
+    )
+    parser.add_argument(
         "--stop-after",
         choices=["stage1", "stage2", "validation"],
         default="validation",
@@ -32,6 +40,12 @@ def main() -> None:
     )
     args = parser.parse_args()
     cfg = load_config(args.config)
+    if args.resume_batch_size is not None:
+        if args.command != "search":
+            parser.error("--resume-batch-size is only valid with the search command")
+        if args.resume_batch_size < 1:
+            parser.error("--resume-batch-size must be at least 1")
+        cfg.model.batch_size = args.resume_batch_size
     if args.backend is not None:
         cfg.backend = args.backend
     if args.command == "report":
@@ -104,7 +118,11 @@ def main() -> None:
         manifest = make_manifest(
             cfg, {key: [item.id for item in value] for key, value in splits.items()}
         )
-        store = RunStore(cfg.output_dir, manifest)
+        store = RunStore(
+            cfg.output_dir,
+            manifest,
+            allow_batch_size_change=args.resume_batch_size is not None,
+        )
         if args.command == "evaluate" and not (cfg.output_dir / "selected_route.json").exists():
             raise ValueError("Run search first; evaluation requires a frozen selected_route.json")
         # Fail on missing NeMo dependencies before loading the checkpoint.

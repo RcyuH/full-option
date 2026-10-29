@@ -97,20 +97,91 @@ def make_manifest(cfg: ExperimentConfig, split_ids: dict[str, list[str]]) -> dic
 class RunStore:
     """Callers hold a file lock for the entire run, including manifest validation."""
 
-    def __init__(self, root: Path, manifest: dict) -> None:
+    # These modules changed in the follow-up that added configurable loop
+    # factors. The actual generation/search implementation is separately
+    # fingerprinted and must still match the original run.
+    _RESUME_COMPATIBLE_SOURCE_FILES = {
+        "artifacts.py",
+        "cli.py",
+        "config.py",
+        "report.py",
+        "routes.py",
+    }
+
+    def __init__(
+        self, root: Path, manifest: dict, *, allow_batch_size_change: bool = False
+    ) -> None:
         self.root = root
         self.fingerprint = manifest["fingerprint"]
         path = root / "manifest.json"
         if path.exists():
             old = json.loads(path.read_text())
             if old != manifest:
-                raise ValueError(
-                    "Run provenance changed. Choose a fresh output_dir; refusing mixed results."
+                if not allow_batch_size_change or not self._compatible_batch_resume(old, manifest):
+                    raise ValueError(
+                        "Run provenance changed. Choose a fresh output_dir; refusing mixed results."
+                    )
+                # Existing tapes and selected artifacts retain the original
+                # fingerprint. Only missing examples are generated with the
+                # explicitly requested, lower runtime batch size.
+                self.fingerprint = old["fingerprint"]
+                print(
+                    "Resuming existing run with a different batch_size; retaining its original fingerprint.",
+                    flush=True,
                 )
         else:
+            if allow_batch_size_change:
+                raise ValueError("--resume-batch-size requires an existing manifest.json")
             if any(root.glob("predictions/**/*.jsonl")) or (root / "selected_route.json").exists():
                 raise ValueError("Existing results without a manifest; choose a fresh output_dir")
             atomic_json(path, manifest)
+
+    @classmethod
+    def _compatible_batch_resume(cls, old: dict, new: dict) -> bool:
+        """Permit only a batch-size change plus known loop-factor release metadata."""
+        if old.get("schema_version") != new.get("schema_version"):
+            return False
+        for candidate in (old, new):
+            fingerprint = candidate.get("fingerprint")
+            payload = {key: value for key, value in candidate.items() if key != "fingerprint"}
+            if fingerprint != digest_json(payload):
+                return False
+
+        old_config = json.loads(json.dumps(old.get("config", {})))
+        new_config = json.loads(json.dumps(new.get("config", {})))
+        try:
+            old_batch = old_config["model"]["batch_size"]
+            new_batch = new_config["model"]["batch_size"]
+            if old_batch == new_batch:
+                return False
+            old_config["model"]["batch_size"] = new_config["model"]["batch_size"]
+            # loop_factors was added later; absent in old manifests means [2].
+            old_config.setdefault("search", {}).setdefault("loop_factors", [2])
+            new_config.setdefault("search", {}).setdefault("loop_factors", [2])
+        except (KeyError, TypeError):
+            return False
+        if old_config != new_config:
+            return False
+
+        old_sources = old.get("source_sha256", {})
+        new_sources = new.get("source_sha256", {})
+        if old_sources.keys() != new_sources.keys():
+            return False
+        changed_sources = {
+            name for name in old_sources if old_sources[name] != new_sources[name]
+        }
+        if not changed_sources.issubset(cls._RESUME_COMPATIBLE_SOURCE_FILES):
+            return False
+
+        old_without_fingerprint = {k: v for k, v in old.items() if k != "fingerprint"}
+        new_without_fingerprint = {k: v for k, v in new.items() if k != "fingerprint"}
+        old_without_fingerprint["config"] = old_config
+        new_without_fingerprint["config"] = new_config
+        # Compare everything else exactly, allowing source hashes only for
+        # the explicitly listed, non-generation modules above.
+        old_without_fingerprint["source_sha256"] = {}
+        new_without_fingerprint["source_sha256"] = {}
+        return old_without_fingerprint == new_without_fingerprint
 
     def tape_path(self, stage: str, route_id: str) -> Path:
         return self.root / "predictions" / stage / (route_id.replace(":", "_") + ".jsonl")

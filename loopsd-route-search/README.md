@@ -98,6 +98,23 @@ hai tiến trình cùng ghi một run. Nếu bị dừng giữa batch, batch g�
 mới được phục hồi tự động. Lỗi inference, JSON hỏng ở giữa file hoặc thay đổi
 provenance sẽ làm lệnh dừng, không bị đổi thành một câu trả lời sai.
 
+Nếu search bị gián đoạn do OOM, resume bằng batch nhỏ hơn với cùng config,
+checkpoint, dữ liệu và `output_dir`. Ví dụ:
+
+```bash
+python examples/nemo_search.py search \
+  --config configs/qwen3_1p7b_gsm8k_full_b200.yaml \
+  --resume-batch-size 16
+```
+
+Cờ này kiểm tra lại các đầu vào và code sinh/search, chỉ cho phép khác
+`batch_size` (cùng metadata tương thích `[2]` được thêm ở revision sau), và giữ
+fingerprint ban đầu để các tape đã ghi tiếp tục hợp lệ. Sau OOM, chọn giá trị
+thận trọng như `8` hoặc `16`. Chương trình chỉ sinh các ví dụ còn thiếu; kết quả
+đã lưu được giữ nguyên. Khác batch size có thể tạo sai khác dấu phẩy động nhỏ
+cho các ví dụ sinh mới, nên đây là cách phục hồi run thực tế chứ không đảm bảo
+khớp bit-for-bit. Không xóa hoặc thay `manifest.json`.
+
 ## Dùng NeMo RL
 
 Adapter ở `src/loopsd_search/nemo_adapter.py` có `generate`, lifecycle và dữ liệu
@@ -181,8 +198,9 @@ Mỗi run lưu trong `output_dir`:
 | `route_scores.csv`, `route_landscape.png` | Bảng và heatmap search; heatmap không phải test accuracy |
 | `verification.json` | Kiểm tra numerical trên model thật |
 
-Model/data/code/config thay đổi sẽ làm resume bị từ chối; tạo output mới cho
-thí nghiệm mới. Không chỉnh tay selection để thử nhiều route trên test.
+Thay đổi model/data/decode/backend sẽ làm resume bị từ chối; tạo output mới cho
+thí nghiệm mới. Chỉ được đổi batch size bằng cờ `--resume-batch-size` ở trên.
+Không chỉnh tay selection để thử nhiều route trên test.
 
 ## Kiểm thử và smoke run
 
