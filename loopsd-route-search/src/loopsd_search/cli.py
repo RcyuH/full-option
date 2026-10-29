@@ -121,7 +121,6 @@ def main() -> None:
         store = RunStore(
             cfg.output_dir,
             manifest,
-            allow_compatible_resume=(args.command == "evaluate" or args.resume_batch_size is not None),
             allow_batch_size_change=args.resume_batch_size is not None,
         )
         if args.command == "evaluate" and not (cfg.output_dir / "selected_route.json").exists():

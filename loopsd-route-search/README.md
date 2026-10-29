@@ -98,6 +98,10 @@ hai tiến trình cùng ghi một run. Nếu bị dừng giữa batch, batch g�
 mới được phục hồi tự động. Lỗi inference, JSON hỏng ở giữa file hoặc thay đổi
 provenance sẽ làm lệnh dừng, không bị đổi thành một câu trả lời sai.
 
+Đổi `model.device` (ví dụ `cuda:1` sang `cuda:0`) được xem là đổi thiết bị thực
+thi và không làm mất khả năng resume; kiểm tra provenance vẫn giữ nguyên model,
+dữ liệu, decode, backend và thuật toán.
+
 Nếu search bị gián đoạn do OOM, resume bằng batch nhỏ hơn với cùng config,
 checkpoint, dữ liệu và `output_dir`. Ví dụ:
 

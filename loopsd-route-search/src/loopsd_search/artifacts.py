@@ -113,7 +113,6 @@ class RunStore:
         root: Path,
         manifest: dict,
         *,
-        allow_compatible_resume: bool = False,
         allow_batch_size_change: bool = False,
     ) -> None:
         self.root = root
@@ -122,18 +121,17 @@ class RunStore:
         if path.exists():
             old = json.loads(path.read_text())
             if old != manifest:
-                if not allow_compatible_resume or not self._compatible_resume(
+                if not self._compatible_resume(
                     old, manifest, allow_batch_size_change=allow_batch_size_change
                 ):
                     raise ValueError(
                         "Run provenance changed. Choose a fresh output_dir; refusing mixed results."
                     )
                 # Existing tapes and selected artifacts retain the original
-                # fingerprint. Only missing examples are generated with the
-                # explicitly requested, lower runtime batch size.
+                # fingerprint while missing examples are generated.
                 self.fingerprint = old["fingerprint"]
                 print(
-                    "Resuming existing run with a different batch_size; retaining its original fingerprint.",
+                    "Resuming compatible run; retaining its original fingerprint.",
                     flush=True,
                 )
         else:
@@ -164,6 +162,9 @@ class RunStore:
             if old_batch != new_batch and not allow_batch_size_change:
                 return False
             old_config["model"]["batch_size"] = new_config["model"]["batch_size"]
+            # Device selection is an execution detail; allow remapping
+            # cuda:0/cuda:1 without changing the experiment identity.
+            old_config["model"]["device"] = new_config["model"]["device"]
             # loop_factors was added later; absent in old manifests means [2].
             old_config.setdefault("search", {}).setdefault("loop_factors", [2])
             new_config.setdefault("search", {}).setdefault("loop_factors", [2])
